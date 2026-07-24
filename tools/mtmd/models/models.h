@@ -199,6 +199,22 @@ struct clip_graph_mobilenetv5 : clip_graph {
         const mobilenetv5_block & block);
 };
 
+struct clip_graph_fastvithd : clip_graph {
+    clip_graph_fastvithd(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    ggml_cgraph * build() override;
+
+    ggml_tensor * conv2d(const fastvit_conv2d & c, ggml_tensor * x, int stride, int pad, bool depthwise);
+    ggml_tensor * gelu_act(ggml_tensor * x);
+    ggml_tensor * layer_scale(ggml_tensor * x, ggml_tensor * ls);
+    ggml_tensor * convffn(ggml_tensor * x, const fastvit_conv2d & dw, const fastvit_conv2d & fc1, const fastvit_conv2d & fc2);
+    ggml_tensor * repmixer_block(ggml_tensor * x, const fastvit_repmixer_block & blk);
+    ggml_tensor * channel_norm(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, float eps = 1e-5f);
+    ggml_tensor * mhsa(ggml_tensor * x, const fastvit_attn_block & blk);
+    ggml_tensor * attn_block(ggml_tensor * x, const fastvit_attn_block & blk);
+    ggml_tensor * downsample(ggml_tensor * x, const fastvit_conv2d & lkb, const fastvit_conv2d & pw);
+    ggml_tensor * se_block(ggml_tensor * x);
+};
+
 struct clip_graph_qwen3a : clip_graph {
     clip_graph_qwen3a(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;

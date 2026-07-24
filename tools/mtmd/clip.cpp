@@ -1020,6 +1020,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_granite4_vision>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_JINGYU:
+            {
+                builder = std::make_unique<clip_graph_fastvithd>(ctx, img);
+            } break;
         default:
             GGML_ABORT("missing cgraph builder");
     }
@@ -1296,6 +1300,21 @@ struct clip_model_loader {
                             hparams.image_resize_algo_rf = RESIZE_ALGO_BICUBIC;
                             hparams.image_resize_algo_ov = RESIZE_ALGO_BILINEAR;
                         }
+                    } break;
+                case PROJECTOR_TYPE_JINGYU:
+                    {
+                        // Jingyu: letterbox pad-to-square with black, bicubic to 1024.
+                        hparams.has_llava_projector = false;
+                        hparams.image_pad_color     = {0, 0, 0};
+                        hparams.image_resize_pad    = PAD_CEIL;
+                        hparams.image_resize_algo   = RESIZE_ALGO_BICUBIC;
+                        if (hparams.image_size <= 0) {
+                            hparams.image_size = 1024;
+                        }
+                        if (hparams.patch_size <= 0) {
+                            hparams.patch_size = 64;
+                        }
+                        hparams.warmup_image_size = hparams.image_size;
                     } break;
                 case PROJECTOR_TYPE_GLM_EDGE:
                     {
@@ -1856,7 +1875,8 @@ struct clip_model_loader {
         model.position_embeddings = get_tensor(string_format(TN_POS_EMBD, prefix), false);
 
         const bool has_standard_layers = (
-            model.proj_type != PROJECTOR_TYPE_GEMMA3NV);
+            model.proj_type != PROJECTOR_TYPE_GEMMA3NV &&
+            model.proj_type != PROJECTOR_TYPE_JINGYU);
 
         // layers
         const int n_layers_to_load = has_standard_layers ? hparams.n_layer : 0;
@@ -1964,6 +1984,97 @@ struct clip_model_loader {
                         model.proj_type = PROJECTOR_TYPE_MLP_NORM;
                     }
                     model.image_newline = get_tensor(TN_IMAGE_NEWLINE, false);
+                } break;
+            case PROJECTOR_TYPE_JINGYU:
+                {
+                    auto load_conv = [&](fastvit_conv2d & c, const std::string & wname, const std::string & bname) {
+                        c.w = get_tensor(wname);
+                        c.b = get_tensor(bname, false);
+                    };
+                    auto load_repmixer = [&](int ni, int n_blk, std::vector<fastvit_repmixer_block> & out) {
+                        out.resize(n_blk);
+                        for (int bi = 0; bi < n_blk; ++bi) {
+                            auto & blk = out[bi];
+                            load_conv(blk.mixer,
+                                string_format(TN_FV_NET_MIXER, ni, bi, "weight"),
+                                string_format(TN_FV_NET_MIXER, ni, bi, "bias"));
+                            blk.ls = get_tensor(string_format(TN_FV_NET_LS, ni, bi));
+                            load_conv(blk.ffn_dw,
+                                string_format(TN_FV_NET_FFN_DW, ni, bi, "weight"),
+                                string_format(TN_FV_NET_FFN_DW, ni, bi, "bias"));
+                            load_conv(blk.ffn_fc1,
+                                string_format(TN_FV_NET_FFN_FC1, ni, bi, "weight"),
+                                string_format(TN_FV_NET_FFN_FC1, ni, bi, "bias"));
+                            load_conv(blk.ffn_fc2,
+                                string_format(TN_FV_NET_FFN_FC2, ni, bi, "weight"),
+                                string_format(TN_FV_NET_FFN_FC2, ni, bi, "bias"));
+                        }
+                    };
+                    auto load_attn = [&](int ni, int n_blk, std::vector<fastvit_attn_block> & out) {
+                        out.resize(n_blk);
+                        for (int bi = 0; bi < n_blk; ++bi) {
+                            auto & blk = out[bi];
+                            blk.norm_w = get_tensor(string_format(TN_FV_NET_NORM, ni, bi, "weight"));
+                            blk.norm_b = get_tensor(string_format(TN_FV_NET_NORM, ni, bi, "bias"));
+                            blk.qkv_w  = get_tensor(string_format(TN_FV_NET_QKV, ni, bi, "weight"));
+                            blk.qkv_b  = get_tensor(string_format(TN_FV_NET_QKV, ni, bi, "bias"), false);
+                            blk.proj_w = get_tensor(string_format(TN_FV_NET_PROJ, ni, bi, "weight"));
+                            blk.proj_b = get_tensor(string_format(TN_FV_NET_PROJ, ni, bi, "bias"), false);
+                            blk.ls1    = get_tensor(string_format(TN_FV_NET_LS1, ni, bi));
+                            blk.ls2    = get_tensor(string_format(TN_FV_NET_LS2, ni, bi));
+                            load_conv(blk.ffn_dw,
+                                string_format(TN_FV_NET_FFN_DW, ni, bi, "weight"),
+                                string_format(TN_FV_NET_FFN_DW, ni, bi, "bias"));
+                            load_conv(blk.ffn_fc1,
+                                string_format(TN_FV_NET_FFN_FC1, ni, bi, "weight"),
+                                string_format(TN_FV_NET_FFN_FC1, ni, bi, "bias"));
+                            load_conv(blk.ffn_fc2,
+                                string_format(TN_FV_NET_FFN_FC2, ni, bi, "weight"),
+                                string_format(TN_FV_NET_FFN_FC2, ni, bi, "bias"));
+                        }
+                    };
+
+                    for (int i = 0; i < 3; ++i) {
+                        load_conv(model.fv_stem[i],
+                            string_format(TN_FV_STEM, i, "weight"),
+                            string_format(TN_FV_STEM, i, "bias"));
+                    }
+                    load_repmixer(0, 2,  model.fv_stage0);
+                    load_repmixer(2, 12, model.fv_stage1);
+                    load_repmixer(4, 24, model.fv_stage2);
+                    load_attn(7, 4, model.fv_stage3);
+                    load_attn(10, 2, model.fv_stage4);
+
+                    const int down_net[4] = {1, 3, 5, 8};
+                    for (int di = 0; di < 4; ++di) {
+                        for (int pi = 0; pi < 2; ++pi) {
+                            load_conv(model.fv_down[di][pi],
+                                string_format(TN_FV_NET_DOWN, down_net[di], pi, "weight"),
+                                string_format(TN_FV_NET_DOWN, down_net[di], pi, "bias"));
+                        }
+                    }
+                    load_conv(model.fv_pos[0],
+                        string_format(TN_FV_NET_POS, 6, "weight"),
+                        string_format(TN_FV_NET_POS, 6, "bias"));
+                    load_conv(model.fv_pos[1],
+                        string_format(TN_FV_NET_POS, 9, "weight"),
+                        string_format(TN_FV_NET_POS, 9, "bias"));
+
+                    load_conv(model.fv_conv_exp,
+                        string_format(TN_FV_CONV_EXP, "weight"),
+                        string_format(TN_FV_CONV_EXP, "bias"));
+                    load_conv(model.fv_se_reduce,
+                        string_format(TN_FV_CONV_EXP_SE_R, "weight"),
+                        string_format(TN_FV_CONV_EXP_SE_R, "bias"));
+                    load_conv(model.fv_se_expand,
+                        string_format(TN_FV_CONV_EXP_SE_E, "weight"),
+                        string_format(TN_FV_CONV_EXP_SE_E, "bias"));
+
+                    // mlp2x_gelu projector
+                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"), false);
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"), false);
                 } break;
             case PROJECTOR_TYPE_LDP:
                 {
@@ -3307,8 +3418,9 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_MLP_NORM:
         case PROJECTOR_TYPE_JANUS_PRO:
         case PROJECTOR_TYPE_PHI4:
+        case PROJECTOR_TYPE_JINGYU:
             {
-                // do nothing
+                // do nothing — n_patches = (H/patch)*(W/patch); FastViT-HD: 16x16=256
             } break;
         case PROJECTOR_TYPE_YASA2:
             {
@@ -4195,8 +4307,9 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
         case PROJECTOR_TYPE_COGVLM:
         case PROJECTOR_TYPE_YASA2:
         case PROJECTOR_TYPE_GEMMA4UA:
+        case PROJECTOR_TYPE_JINGYU:
             {
-                // do nothing
+                // do nothing (inp_raw already set)
             } break;
         case PROJECTOR_TYPE_HUNYUANVL:
             {
@@ -4560,6 +4673,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_LIGHTONOCR:
         case PROJECTOR_TYPE_DOTS_OCR:
+        case PROJECTOR_TYPE_JINGYU:
             return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_MLP_NORM:
             return ctx->model.mm_3_b->ne[0];

@@ -347,6 +347,34 @@ struct qf_block {
     std::vector<clip_layer> qf_proj_layers;
 };
 
+// Jingyu
+struct fastvit_conv2d {
+    ggml_tensor * w = nullptr;
+    ggml_tensor * b = nullptr;
+};
+
+struct fastvit_repmixer_block {
+    fastvit_conv2d mixer;
+    ggml_tensor * ls = nullptr; // layer_scale [C,1,1]
+    fastvit_conv2d ffn_dw;      // fused DW+BN 7x7
+    fastvit_conv2d ffn_fc1;
+    fastvit_conv2d ffn_fc2;
+};
+
+struct fastvit_attn_block {
+    ggml_tensor * norm_w = nullptr;
+    ggml_tensor * norm_b = nullptr;
+    ggml_tensor * qkv_w  = nullptr;
+    ggml_tensor * qkv_b  = nullptr;
+    ggml_tensor * proj_w = nullptr;
+    ggml_tensor * proj_b = nullptr;
+    ggml_tensor * ls1    = nullptr;
+    ggml_tensor * ls2    = nullptr;
+    fastvit_conv2d ffn_dw;
+    fastvit_conv2d ffn_fc1;
+    fastvit_conv2d ffn_fc2;
+};
+
 struct clip_model {
     clip_modality modality = CLIP_MODALITY_VISION;
     projector_type proj_type = PROJECTOR_TYPE_MLP;
@@ -498,6 +526,19 @@ struct clip_model {
     ggml_tensor * mobilenet_stem_conv_b = nullptr;
     ggml_tensor * mobilenet_stem_norm_w = nullptr;
     ggml_tensor * mm_post_proj_norm_w = nullptr;
+
+    // Jingyu
+    fastvit_conv2d fv_stem[3];
+    std::vector<fastvit_repmixer_block> fv_stage0; // network.0  (2 @ 96)
+    std::vector<fastvit_repmixer_block> fv_stage1; // network.2 (12 @ 192)
+    std::vector<fastvit_repmixer_block> fv_stage2; // network.4 (24 @ 384)
+    std::vector<fastvit_attn_block>     fv_stage3; // network.7  (4 @ 768)
+    std::vector<fastvit_attn_block>     fv_stage4; // network.10 (2 @ 1536)
+    fastvit_conv2d fv_down[4][2]; // network 1,3,5,8  each: lkb + 1x1
+    fastvit_conv2d fv_pos[2];     // network 6,9
+    fastvit_conv2d fv_conv_exp;
+    fastvit_conv2d fv_se_reduce;
+    fastvit_conv2d fv_se_expand;
 
     // Multi-Scale Fusion Adapter (MSFA) components
     ggml_tensor * msfa_concat_conv_w = nullptr;

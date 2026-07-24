@@ -6,51 +6,52 @@ set(MTMD_VIDEO ON CACHE BOOL "enable video support in mtmd (requires ffmpeg bina
 find_package(Threads REQUIRED)
 
 add_library(mtmd
-            mtmd.cpp
-            mtmd-audio.cpp
-            mtmd-image.cpp
-            mtmd.h
-            mtmd-helper.cpp
-            mtmd-helper.h
-            clip.cpp
-            clip.h
+            clip-graph.h
             clip-impl.h
             clip-model.h
-            clip-graph.h
-            models/models.h
+            clip.cpp
+            clip.h
             models/cogvlm.cpp
             models/conformer.cpp
+            models/deepseekocr.cpp
+            models/deepseekocr2.cpp
             models/dotsocr.cpp
             models/exaone4_5.cpp
+            models/fastvithd.cpp
             models/gemma4a.cpp
-            models/gemma4v.cpp
             models/gemma4ua.cpp
             models/gemma4uv.cpp
+            models/gemma4v.cpp
             models/glm4v.cpp
             models/granite-speech.cpp
             models/granite4-vision.cpp
             models/hunyuanvl.cpp
             models/internvl.cpp
-            models/kimivl.cpp
             models/kimik25.cpp
-            models/nemotron-v2-vl.cpp
+            models/kimivl.cpp
             models/llama4.cpp
             models/llava.cpp
+            models/mimovl.cpp
             models/minicpmv.cpp
+            models/mobilenetv5.cpp
+            models/models.h
+            models/nemotron-v2-vl.cpp
             models/paddleocr.cpp
             models/pixtral.cpp
             models/qwen2vl.cpp
-            models/qwen3vl.cpp
-            models/mimovl.cpp
             models/qwen3a.cpp
-            models/step3vl.cpp
+            models/qwen3vl.cpp
             models/siglip.cpp
+            models/step3vl.cpp
             models/whisper-enc.cpp
-            models/deepseekocr.cpp
-            models/deepseekocr2.cpp
-            models/mobilenetv5.cpp
-            models/youtuvl.cpp
             models/yasa2.cpp
+            models/youtuvl.cpp
+            mtmd-audio.cpp
+            mtmd-helper.cpp
+            mtmd-helper.h
+            mtmd-image.cpp
+            mtmd.cpp
+            mtmd.h
             )
 
 set_target_properties(mtmd PROPERTIES

@@ -408,6 +408,11 @@ struct mtmd_context {
                         image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(ctx_v);
                     }
                 } break;
+            case PROJECTOR_TYPE_JINGYU:
+                {
+                    // Jingyu: single 1024x1024 letterboxed overview (no UHD slicing).
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(ctx_v);
+                } break;
             case PROJECTOR_TYPE_MINICPMV:
                 {
                     int minicpmv_version = clip_get_hparams(ctx_v)->minicpmv_version;
