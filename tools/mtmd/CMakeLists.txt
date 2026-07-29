@@ -49,11 +49,13 @@ add_library(mtmd
             models/minimax-m3.cpp
             models/qwen3a.cpp
             models/qwen3vl.cpp
+            models/mimo-audio.cpp
             models/siglip.cpp
             models/step3vl.cpp
             models/whisper-enc.cpp
             models/yasa2.cpp
             models/youtuvl.cpp
+            models/parakeet.cpp
             mtmd-audio.cpp
             mtmd-helper.cpp
             mtmd-helper.h

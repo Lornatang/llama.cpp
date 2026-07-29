@@ -82,6 +82,13 @@
 #define KEY_A_PROJ_WINDOW_SIZE     "clip.audio.projector.window_size"
 #define KEY_A_PROJ_DOWNSAMPLE_RATE "clip.audio.projector.downsample_rate"
 #define KEY_A_PROJ_HEAD_COUNT      "clip.audio.projector.head_count"
+#define KEY_A_RVQ_NUM_QUANTIZERS   "clip.audio.rvq.num_quantizers"   // mimo-audio-tokenizer
+#define KEY_A_RVQ_CODEBOOK_SIZE    "clip.audio.rvq.codebook_size"    // mimo-audio-tokenizer: per-quantizer bin count
+#define KEY_A_WA_PATTERN_MODE      "clip.audio.wa_pattern_mode"      // mimo-audio-tokenizer, per-layer -1 (full) / 0 (windowed)
+#define KEY_A_ATTN_WINDOW_SIZE     "clip.audio.window_size"          // mimo-audio-tokenizer: sliding-window radius
+#define KEY_A_LOCAL_BLOCK_COUNT    "clip.audio.local_block_count"    // mimo-v2.5: input_local_transformer layer count
+#define KEY_A_LOCAL_GROUP_SIZE     "clip.audio.local_group_size"     // mimo-v2.5: input_local_transformer grouping size
+#define KEY_AUDIO_SUBSAMPLING_FACTOR "clip.audio.subsampling_factor"
 
 //
 // tensor name constants
@@ -174,6 +181,24 @@
 #define TN_MM_AUDIO_FC  "mm.a.fc.%s"  // fully connected layer
 #define TN_MM_NORM_PRE  "mm.a.norm_pre.%s"
 #define TN_MM_NORM_MID  "mm.a.norm_mid.%s"
+
+// mimo-audio-tokenizer
+#define TN_A_DOWNSAMPLE_CONV "a.downsample.conv.%s"
+#define TN_A_DOWNSAMPLE_NORM "a.downsample.norm.%s"
+#define TN_A_RVQ_CODEBOOK    "a.rvq.codebook.%s"
+// mimo-v2.5: text-side RVQ code embedding ("text codebook")
+#define TN_MM_A_CODE_EMBD    "mm.a.code_embd.%s"
+// mimo-v2.5: LLM-side connector (input_local_transformer)
+#define TN_MM_A_LOCAL_ATTN_Q   "mm.a.local_blk.%d.attn_q.%s"
+#define TN_MM_A_LOCAL_ATTN_K   "mm.a.local_blk.%d.attn_k.%s"
+#define TN_MM_A_LOCAL_ATTN_V   "mm.a.local_blk.%d.attn_v.%s"
+#define TN_MM_A_LOCAL_ATTN_OUT "mm.a.local_blk.%d.attn_out.%s"
+#define TN_MM_A_LOCAL_FFN_GATE "mm.a.local_blk.%d.ffn_gate.%s"
+#define TN_MM_A_LOCAL_FFN_UP   "mm.a.local_blk.%d.ffn_up.%s"
+#define TN_MM_A_LOCAL_FFN_DOWN "mm.a.local_blk.%d.ffn_down.%s"
+#define TN_MM_A_LOCAL_LN1      "mm.a.local_blk.%d.ln1.%s"
+#define TN_MM_A_LOCAL_LN2      "mm.a.local_blk.%d.ln2.%s"
+#define TN_MM_A_LOCAL_NORM     "mm.a.local_norm.%s"
 
 // cogvlm
 #define TN_MM_POST_FC_NORM "mm.post_fc_norm.%s"
@@ -332,6 +357,12 @@
 #define TN_FV_CONV_EXP_SE_R "v.fastvit.conv_exp.se.reduce.%s"
 #define TN_FV_CONV_EXP_SE_E "v.fastvit.conv_exp.se.expand.%s"
 
+// parakeet
+#define TN_MEL_FILTERS           "a.mel_filters"
+#define TN_WINDOW                "a.window"
+#define TN_CONV_NORM_MEAN        "%s.blk.%d.conv_norm_mean"
+#define TN_CONV_NORM_VAR         "%s.blk.%d.conv_norm_var"
+
 // align x to upper multiple of n
 #define CLIP_ALIGN(x, n) ((((x) + (n) - 1) / (n)) * (n))
 
@@ -372,6 +403,7 @@ enum projector_type {
     PROJECTOR_TYPE_LLAMA4,
     PROJECTOR_TYPE_MERALION,
     PROJECTOR_TYPE_MIMOVL,
+    PROJECTOR_TYPE_MIMO_AUDIO,
     PROJECTOR_TYPE_MINICPMV,
     PROJECTOR_TYPE_MINICPMV4_6,
     PROJECTOR_TYPE_MINIMAX_M3,
@@ -380,6 +412,7 @@ enum projector_type {
     PROJECTOR_TYPE_MUSIC_FLAMINGO,
     PROJECTOR_TYPE_NEMOTRON_V2_VL,
     PROJECTOR_TYPE_PADDLEOCR,
+    PROJECTOR_TYPE_PARAKEET,
     PROJECTOR_TYPE_PHI4,
     PROJECTOR_TYPE_PIXTRAL,
     PROJECTOR_TYPE_QWEN25O,  // will be replaced by QWEN2A or QWEN25VL depending on clip_ctx
@@ -429,6 +462,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_LLAMA4,          "llama4"           },
     { PROJECTOR_TYPE_MERALION,        "meralion"         },
     { PROJECTOR_TYPE_MIMOVL,          "mimovl"           },
+    { PROJECTOR_TYPE_MIMO_AUDIO,      "mimo_audio"       },
     { PROJECTOR_TYPE_MINICPMV,        "resampler"        },
     { PROJECTOR_TYPE_MINICPMV4_6,     "minicpmv4_6"      },
     { PROJECTOR_TYPE_MINIMAX_M3,      "minimax_m3"       },
@@ -436,6 +470,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_MUSIC_FLAMINGO,  "musicflamingo"    },
     { PROJECTOR_TYPE_NEMOTRON_V2_VL,  "nemotron_v2_vl"   },
     { PROJECTOR_TYPE_PADDLEOCR,       "paddleocr"        },
+    { PROJECTOR_TYPE_PARAKEET,        "parakeet"         },
     { PROJECTOR_TYPE_PHI4,            "phi4"             },
     { PROJECTOR_TYPE_PIXTRAL,         "pixtral"          },
     { PROJECTOR_TYPE_QWEN25O,         "qwen2.5o"         },
