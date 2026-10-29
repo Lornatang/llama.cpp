@@ -21,8 +21,12 @@ from .qwen import Qwen3Model
 
 
 def _fuse_conv_bn(
-    weight: torch.Tensor, bn_weight: torch.Tensor, bn_bias: torch.Tensor,
-    running_mean: torch.Tensor, running_var: torch.Tensor, eps: float = 1e-5,
+    weight: torch.Tensor,
+    bn_weight: torch.Tensor,
+    bn_bias: torch.Tensor,
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    eps: float = 1e-5,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fuse a Conv2d and BatchNorm2d into a single conv weight/bias pair.
 
@@ -127,8 +131,8 @@ class JingyuVisionModel(MmprojModel):
     def set_gguf_parameters(self) -> None:
         """Write Jingyu mmproj metadata expected by the C++ clip loader.
 
-        Writes projector type, image/patch sizes, embedding dims, normalization stats, and architecture constants under the ``fastvit.*`` key
-        namespace.
+        Writes projector type, image/patch sizes, embedding dims and normalization stats, then validates that the
+        checkpoint architecture matches the constants hard-coded in the C++ FastViT-HD graph.
 
         Returns:
             None
@@ -157,18 +161,29 @@ class JingyuVisionModel(MmprojModel):
         self.gguf_writer.add_vision_image_mean(mean)
         self.gguf_writer.add_vision_image_std(std)
 
-        # Architecture constants consumed by the C++ Jingyu vision graph.
-        self.gguf_writer.add_uint32("fastvit.image_size", image_size)
-        self.gguf_writer.add_uint32("fastvit.patch_size", patch_size)
-        self.gguf_writer.add_uint32("fastvit.embed_dim", vision_dim)
-        for i, d in enumerate((self.hparams_vision or {}).get("embed_dims", [96, 192, 384, 768, 1536])):
-            self.gguf_writer.add_uint32(f"fastvit.embed_dims.{i}", int(d))
-        for i, n in enumerate((self.hparams_vision or {}).get("layers", [2, 12, 24, 4, 2])):
-            self.gguf_writer.add_uint32(f"fastvit.layers.{i}", int(n))
+        # The C++ FastViT-HD graph hard-codes the architecture (stage layout, embed
+        # dims, resolution). Reject mismatching checkpoints instead of writing a
+        # file that silently produces wrong embeddings or aborts at load time.
+        expected_layers = [2, 12, 24, 4, 2]
+        expected_embed_dims = [96, 192, 384, 768, 1536]
+        cfg_vision = self.hparams_vision or {}
+        layers = [int(v) for v in cfg_vision.get("layers", expected_layers)]
+        embed_dims = [int(v) for v in cfg_vision.get("embed_dims", expected_embed_dims)]
+
+        if image_size != 1024 or patch_size != 64:
+            raise ValueError(f"jingyu: unsupported image_size={image_size} patch_size={patch_size}; " "the C++ vision graph only supports 1024/64")
+        if layers != expected_layers:
+            raise ValueError(f"jingyu: unsupported layer layout {layers}, expected {expected_layers}")
+        if embed_dims != expected_embed_dims:
+            raise ValueError(f"jingyu: unsupported embed_dims {embed_dims}, expected {expected_embed_dims}")
 
         logger.info(
             "Jingyu mmproj: projector=jingyu image=%dx%d patch=%d vision_dim=%d text_dim=%d",
-            image_size, image_size, patch_size, vision_dim, self.n_embd_text,
+            image_size,
+            image_size,
+            patch_size,
+            vision_dim,
+            self.n_embd_text,
         )
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
@@ -342,6 +357,8 @@ class JingyuVisionModel(MmprojModel):
             yield from self._emit(f"v.fastvit.net.{m.group(1)}.blk.{m.group(2)}.ffn.fc{m.group(3)}.{m.group(4)}", data)
             return
 
+        # HF FastViT checkpoints always ship the ConvFFN depthwise conv together with a
+        # BN; the fused dw weight/bias is emitted once the whole BN set has arrived.
         m = re.match(r".*network\.(\d+)\.(\d+)\.convffn\.conv\.(conv\.weight|bn\.(weight|bias|running_mean|running_var|num_batches_tracked))$", name)
         if m:
             ni, bi = m.group(1), m.group(2)
