@@ -168,6 +168,42 @@ static uint32_t hash_pixels(const mtmd_image_u8 & img, uint32_t hash = 216613626
     return hash;
 }
 
+MAKE_TEST(test_image_preprocessor_jingyu) {
+    mtmd_hparams hparams;
+    hparams.image_size = 64;
+    for (int i = 0; i < 3; ++i) {
+        hparams.image_mean[i] = 0.0f;
+        hparams.image_std[i] = 1.0f;
+    }
+    const mtmd_image_preprocessor_jingyu preproc(hparams);
+    // Reference hashes use JingyuImageProcessorFast with TorchVision bicubic resize.
+    const std::vector<std::pair<mtmd_image_size, uint32_t>> cases = {
+        { {81, 30}, 0xdabaaa8d },
+        { {30, 81}, 0x95191c51 },
+        { {81, 81}, 0x09575288 },
+        { {7, 11},  0xa48ae9ac },
+        { {64, 64}, 0xb69fe616 },
+    };
+    for (const auto & [size, expected] : cases) {
+        const auto output = preproc.preprocess(make_test_image(size));
+        if (!t.assert_equal("image count", size_t(1), output.entries.size())) {
+            continue;
+        }
+        const auto & img = output.entries[0];
+        t.assert_equal("output width", 64, img.nx());
+        t.assert_equal("output height", 64, img.ny());
+        uint32_t hash = 2166136261u;
+        for (float pixel : img.get_ro_buf()) {
+            hash = (hash ^ static_cast<uint8_t>(std::lround(pixel * 255.0f))) * 16777619u;
+        }
+        t.assert_equal("pixels of " + image_size_to_str(size), expected, hash);
+    }
+    mtmd_image_u8 placeholder;
+    placeholder.set_size({81, 30}, true);
+    const auto output = preproc.preprocess(placeholder);
+    t.assert_true("placeholder remains a placeholder", output.entries.size() == 1 && output.entries[0].is_placeholder());
+}
+
 MAKE_TEST(test_image_preprocessor_lfm2) {
     mtmd_hparams hparams;
     hparams.patch_size = 16;

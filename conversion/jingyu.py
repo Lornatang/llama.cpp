@@ -107,6 +107,38 @@ class JingyuVisionModel(MmprojModel):
         self.block_count = 1
         self.tensor_map = gguf.get_tensor_name_map(gguf.MODEL_ARCH.MMPROJ, self.block_count)
         self._ffn_bn_buf = {}
+        self._emitted_tensors: set[str] = set()
+
+    @staticmethod
+    def _required_tensors() -> set[str]:
+        required = {f"v.fastvit.stem.{i}.{param}" for i in range(3) for param in ("weight", "bias")}
+        for net, count in ((0, 2), (2, 12), (4, 24), (7, 4), (10, 2)):
+            for block in range(count):
+                prefix = f"v.fastvit.net.{net}.blk.{block}"
+                required.update(f"{prefix}.ffn.{part}.{param}" for part in ("dw", "fc1", "fc2") for param in ("weight", "bias"))
+                if net in (0, 2, 4):
+                    required.update((f"{prefix}.mixer.weight", f"{prefix}.mixer.bias", f"{prefix}.ls.weight"))
+                else:
+                    required.update(f"{prefix}.{part}.weight" for part in ("norm", "qkv", "proj", "ls1", "ls2"))
+                    required.update((f"{prefix}.norm.bias", f"{prefix}.proj.bias"))
+        required.update(f"v.fastvit.net.{net}.down.{part}.{param}"
+                        for net in (1, 3, 5, 8) for part in range(2) for param in ("weight", "bias"))
+        required.update(f"v.fastvit.net.{net}.pos.{param}" for net in (6, 9) for param in ("weight", "bias"))
+        required.update(f"v.fastvit.conv_exp.{part}{param}"
+                        for part in ("", "se.reduce.", "se.expand.") for param in ("weight", "bias"))
+        required.update(f"mm.{i}.{param}" for i in (0, 2) for param in ("weight", "bias"))
+        return required
+
+    def prepare_tensors(self) -> None:
+        super().prepare_tensors()
+        if self._ffn_bn_buf:
+            needed = {"w", "bn_w", "bn_b", "mean", "var"}
+            incomplete = [f"{key}: {', '.join(sorted(needed - set(parts)))}" for key, parts in sorted(self._ffn_bn_buf.items())]
+            raise ValueError(f"jingyu: incomplete ConvFFN batch normalization tensors: {'; '.join(incomplete)}")
+        missing = sorted(self._required_tensors() - self._emitted_tensors)
+        if missing:
+            preview = ", ".join(missing[:10])
+            raise ValueError(f"jingyu: missing {len(missing)} required vision/projector tensors: {preview}")
 
     def get_vision_config(self) -> Dict[str, Any] | None:
         """Build a vision hyperparameter dict for MmprojModel helpers.
@@ -161,8 +193,8 @@ class JingyuVisionModel(MmprojModel):
         self.gguf_writer.add_vision_image_mean(mean)
         self.gguf_writer.add_vision_image_std(std)
 
-        # The C++ FastViT-HD graph hard-codes the architecture (stage layout, embed
-        # dims, resolution). Reject mismatching checkpoints instead of writing a
+        # The C++ FastViT-HD graph hard-codes the stage layout and embed dims.
+        # Reject mismatching checkpoints instead of writing a
         # file that silently produces wrong embeddings or aborts at load time.
         expected_layers = [2, 12, 24, 4, 2]
         expected_embed_dims = [96, 192, 384, 768, 1536]
@@ -170,8 +202,8 @@ class JingyuVisionModel(MmprojModel):
         layers = [int(v) for v in cfg_vision.get("layers", expected_layers)]
         embed_dims = [int(v) for v in cfg_vision.get("embed_dims", expected_embed_dims)]
 
-        if image_size != 1024 or patch_size != 64:
-            raise ValueError(f"jingyu: unsupported image_size={image_size} patch_size={patch_size}; " "the C++ vision graph only supports 1024/64")
+        if image_size <= 0 or image_size % 64 != 0 or patch_size != 64:
+            raise ValueError(f"jingyu: unsupported image_size={image_size} patch_size={patch_size}; image_size must be a positive multiple of 64 and patch_size must be 64")
         if layers != expected_layers:
             raise ValueError(f"jingyu: unsupported layer layout {layers}, expected {expected_layers}")
         if embed_dims != expected_embed_dims:
@@ -187,7 +219,7 @@ class JingyuVisionModel(MmprojModel):
         )
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
-        """Force high precision for vision and projector tensors.
+        """Keep convolution kernels compatible with ggml backends.
 
         Args:
             name (str): Original checkpoint tensor name.
@@ -196,13 +228,13 @@ class JingyuVisionModel(MmprojModel):
             n_dims (int): Number of dimensions of the tensor.
 
         Returns:
-            gguf.GGMLQuantizationType | bool: ``F16`` or ``F32`` for tensors whose ``new_name`` starts with ``v.fastvit.`` or ``mm.``; otherwise the
-            base-class result (a quantization type or ``False`` to keep the default policy).
+            gguf.GGMLQuantizationType | bool: A convolution-compatible type, or the base-class policy for other tensors.
         """
         if new_name.startswith("v.fastvit.") or new_name.startswith("mm."):
-            if self.ftype == gguf.LlamaFileType.MOSTLY_F16:
-                return gguf.GGMLQuantizationType.F16
-            return gguf.GGMLQuantizationType.F32
+            if n_dims == 4:
+                return gguf.GGMLQuantizationType.F32 if self.ftype == gguf.LlamaFileType.ALL_F32 else gguf.GGMLQuantizationType.F16
+            if n_dims == 3:
+                return gguf.GGMLQuantizationType.F32
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 
     @classmethod
@@ -231,6 +263,7 @@ class JingyuVisionModel(MmprojModel):
         Yields:
             Tuple[str, torch.Tensor]: ``(name, float32_contiguous_tensor)``.
         """
+        self._emitted_tensors.add(name)
         yield name, data.contiguous().to(torch.float32)
 
     def _map_projector(self, name: str, data: torch.Tensor) -> Iterable[Tuple[str, torch.Tensor]]:
@@ -362,9 +395,11 @@ class JingyuVisionModel(MmprojModel):
         m = re.match(r".*network\.(\d+)\.(\d+)\.convffn\.conv\.(conv\.weight|bn\.(weight|bias|running_mean|running_var|num_batches_tracked))$", name)
         if m:
             ni, bi = m.group(1), m.group(2)
+            part = m.group(3)
+            if part == "bn.num_batches_tracked":
+                return
             key = f"{ni}.{bi}"
             buf = self._ffn_bn_buf.setdefault(key, {})
-            part = m.group(3)
             if part == "conv.weight":
                 buf["w"] = data
             elif part == "bn.weight":
@@ -375,7 +410,6 @@ class JingyuVisionModel(MmprojModel):
                 buf["mean"] = data
             elif part == "bn.running_var":
                 buf["var"] = data
-            # Ignore num_batches_tracked; it is not needed for inference.
             needed = {"w", "bn_w", "bn_b", "mean", "var"}
             if needed.issubset(buf):
                 fw, fb = _fuse_conv_bn(buf["w"], buf["bn_w"], buf["bn_b"], buf["mean"], buf["var"])

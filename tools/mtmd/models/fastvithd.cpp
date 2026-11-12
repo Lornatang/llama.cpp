@@ -6,7 +6,7 @@
 // Layout throughout: ggml NHWC-like vision tensors are [W, H, C, B].
 
 ggml_tensor * mtmd_graph_fastvithd::gelu_act(ggml_tensor * x) {
-    return ggml_gelu(ctx0, x);
+    return ggml_gelu_erf(ctx0, x);
 }
 
 ggml_tensor * mtmd_graph_fastvithd::conv2d(const fastvit_conv2d & c,
@@ -32,7 +32,14 @@ ggml_tensor * mtmd_graph_fastvithd::conv2d(const fastvit_conv2d & c,
             xin             = ggml_repeat_4d(ctx0, xin, W, H, r, Cin * B);
             xin             = ggml_reshape_4d(ctx0, xin, W, H, Cout, B);
         }
-        cur = ggml_conv_2d_dw(ctx0, c.w, xin, stride, stride, pad, pad, 1, 1);
+        const bool direct_type = (c.w->type == GGML_TYPE_F16 || c.w->type == GGML_TYPE_F32) && xin->type == GGML_TYPE_F32;
+        const bool direct_layout = ggml_is_contiguous(xin) || ggml_is_contiguous_channels(xin);
+        ggml_tensor * direct = direct_type && direct_layout
+            ? ggml_conv_2d_dw_direct(ctx0, c.w, xin, stride, stride, pad, pad, 1, 1)
+            : nullptr;
+        cur = direct && ggml_backend_supports_op(backend, direct)
+            ? direct
+            : ggml_conv_2d_dw(ctx0, c.w, xin, stride, stride, pad, pad, 1, 1);
     } else {
         cur = ggml_conv_2d_direct(ctx0, c.w, x, stride, stride, pad, pad, 1, 1);
     }
@@ -172,13 +179,11 @@ ggml_tensor * mtmd_graph_fastvithd::downsample(ggml_tensor * x, const fastvit_co
 }
 
 ggml_tensor * mtmd_graph_fastvithd::se_block(ggml_tensor * x) {
-    // Hard-coded avg pool 16x16 as in HF SEBlock. This assumes the 1024px / patch64
-    // input (final feature map is 16x16); other resolutions hit the assert below.
+    // SE uses global average pooling over the spatial dimensions.
     const int64_t W = x->ne[0];
     const int64_t H = x->ne[1];
-    GGML_ASSERT(W == 16 && H == 16);
 
-    ggml_tensor * cur = ggml_pool_2d(ctx0, x, GGML_OP_POOL_AVG, 16, 16, 16, 16, 0, 0);
+    ggml_tensor * cur = ggml_pool_2d(ctx0, x, GGML_OP_POOL_AVG, W, H, W, H, 0, 0);
     cur               = conv2d(model.fv_se_reduce, cur, 1, 0, false);
     cur               = ggml_relu(ctx0, cur);
     cur               = conv2d(model.fv_se_expand, cur, 1, 0, false);
@@ -188,7 +193,7 @@ ggml_tensor * mtmd_graph_fastvithd::se_block(ggml_tensor * x) {
 }
 
 ggml_cgraph * mtmd_graph_fastvithd::build() {
-    ggml_tensor * cur = build_inp_raw();  // [W,H,3,B] = 1024x1024
+    ggml_tensor * cur = build_inp_raw();
 
     // convolutional stem: 3x3 s2, DW 3x3 s2, 1x1
     cur = gelu_act(conv2d(model.fv_stem[0], cur, 2, 1, false));

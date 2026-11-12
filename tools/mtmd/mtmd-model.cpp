@@ -315,13 +315,8 @@ struct mtmd_model_loader {
                     {
                         hparams.has_llava_projector = false;
                         hparams.image_pad_color     = {0, 0, 0};
-                        hparams.image_resize_pad    = PAD_CEIL;
-                        hparams.image_resize_algo   = RESIZE_ALGO_BICUBIC;
-                        if (hparams.image_size <= 0) {
-                            hparams.image_size = 1024;
-                        }
-                        if (hparams.patch_size <= 0) {
-                            hparams.patch_size = 64;
+                        if (hparams.patch_size != 64 || hparams.image_size <= 0 || hparams.image_size % 64 != 0) {
+                            throw std::runtime_error(mtmd_format("%s: Jingyu requires patch_size 64 and a positive image_size divisible by 64\n", __func__));
                         }
                         hparams.warmup_image_size = hparams.image_size;
                     } break;

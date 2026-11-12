@@ -332,7 +332,8 @@ struct mtmd_graph_mobilenetv5 : mtmd_graph {
 };
 
 struct mtmd_graph_fastvithd : mtmd_graph {
-    mtmd_graph_fastvithd(mtmd_subcontext * ctx, const mtmd_image_f32 & img) : mtmd_graph(ctx, img) {}
+    ggml_backend_t backend;
+    mtmd_graph_fastvithd(mtmd_subcontext * ctx, const mtmd_image_f32 & img) : mtmd_graph(ctx, img), backend(ctx->backends.backend) {}
     ggml_cgraph * build() override;
 
     ggml_tensor * conv2d(const fastvit_conv2d & c, ggml_tensor * x, int stride, int pad, bool depthwise);

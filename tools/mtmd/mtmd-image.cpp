@@ -788,6 +788,22 @@ mtmd_image_preproc_out mtmd_image_preprocessor_fixed_size::preprocess(const mtmd
     return output;
 }
 
+mtmd_image_preproc_out mtmd_image_preprocessor_jingyu::preprocess(const mtmd_image_u8 & img) const {
+    const auto size = img.get_size();
+    const int side = std::max(size.width, size.height);
+    mtmd_image_u8 square;
+    square.set_size({side, side}, img.is_placeholder());
+    img_tool::fill(square, hparams.image_pad_color);
+    img_tool::composite(square, img, (side - size.width) / 2, (side - size.height) / 2);
+
+    mtmd_image_u8 resized;
+    const auto algo = static_cast<resize_algo>(RESIZE_ALGO_BICUBIC | RESIZE_ALGO_FLAG_TORCH);
+    img_tool::resize(square, resized, {hparams.image_size, hparams.image_size}, algo, PAD_NONE);
+    mtmd_image_preproc_out output;
+    output.append(hparams, resized, true);
+    return output;
+}
+
 //
 // mtmd_image_preprocessor_dyn_size
 //
