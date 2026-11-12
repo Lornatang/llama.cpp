@@ -5,11 +5,11 @@
 // Jingyu FastViT-HD graph (inference-mode fused MobileOne / RepMixer / MHSA).
 // Layout throughout: ggml NHWC-like vision tensors are [W, H, C, B].
 
-ggml_tensor * clip_graph_fastvithd::gelu_act(ggml_tensor * x) {
+ggml_tensor * mtmd_graph_fastvithd::gelu_act(ggml_tensor * x) {
     return ggml_gelu(ctx0, x);
 }
 
-ggml_tensor * clip_graph_fastvithd::conv2d(const fastvit_conv2d & c,
+ggml_tensor * mtmd_graph_fastvithd::conv2d(const fastvit_conv2d & c,
                                            ggml_tensor *          x,
                                            int                    stride,
                                            int                    pad,
@@ -43,7 +43,7 @@ ggml_tensor * clip_graph_fastvithd::conv2d(const fastvit_conv2d & c,
     return cur;
 }
 
-ggml_tensor * clip_graph_fastvithd::layer_scale(ggml_tensor * x, ggml_tensor * ls) {
+ggml_tensor * mtmd_graph_fastvithd::layer_scale(ggml_tensor * x, ggml_tensor * ls) {
     if (!ls) {
         return x;
     }
@@ -56,7 +56,7 @@ ggml_tensor * clip_graph_fastvithd::layer_scale(ggml_tensor * x, ggml_tensor * l
     return ggml_mul(ctx0, x, scale);
 }
 
-ggml_tensor * clip_graph_fastvithd::convffn(ggml_tensor *          x,
+ggml_tensor * mtmd_graph_fastvithd::convffn(ggml_tensor *          x,
                                             const fastvit_conv2d & dw,
                                             const fastvit_conv2d & fc1,
                                             const fastvit_conv2d & fc2) {
@@ -68,7 +68,7 @@ ggml_tensor * clip_graph_fastvithd::convffn(ggml_tensor *          x,
     return cur;
 }
 
-ggml_tensor * clip_graph_fastvithd::repmixer_block(ggml_tensor * x, const fastvit_repmixer_block & blk) {
+ggml_tensor * mtmd_graph_fastvithd::repmixer_block(ggml_tensor * x, const fastvit_repmixer_block & blk) {
     // token_mixer is fused DW conv (already includes residual/scale in reparam weights)
     ggml_tensor * cur = conv2d(blk.mixer, x, 1, 1, true);
     ggml_tensor * ffn = convffn(cur, blk.ffn_dw, blk.ffn_fc1, blk.ffn_fc2);
@@ -76,7 +76,7 @@ ggml_tensor * clip_graph_fastvithd::repmixer_block(ggml_tensor * x, const fastvi
     return ggml_add(ctx0, cur, ffn);
 }
 
-ggml_tensor * clip_graph_fastvithd::channel_norm(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, float eps) {
+ggml_tensor * mtmd_graph_fastvithd::channel_norm(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, float eps) {
     // LayerNorm over channel dim for each spatial location.
     const int64_t W = x->ne[0];
     const int64_t H = x->ne[1];
@@ -101,7 +101,7 @@ ggml_tensor * clip_graph_fastvithd::channel_norm(ggml_tensor * x, ggml_tensor * 
     return cur;
 }
 
-ggml_tensor * clip_graph_fastvithd::mhsa(ggml_tensor * x, const fastvit_attn_block & blk) {
+ggml_tensor * mtmd_graph_fastvithd::mhsa(ggml_tensor * x, const fastvit_attn_block & blk) {
     const int64_t W        = x->ne[0];
     const int64_t H        = x->ne[1];
     const int64_t C        = x->ne[2];
@@ -131,7 +131,7 @@ ggml_tensor * clip_graph_fastvithd::mhsa(ggml_tensor * x, const fastvit_attn_blo
     k               = ggml_cont(ctx0, k);
     v               = ggml_cont(ctx0, v);
 
-    // Match clip_graph::build_attn / llava layout: [d_head, n_head, n_pos]
+    // Match mtmd_graph::build_attn / llava layout: [d_head, n_head, n_pos]
     q = ggml_reshape_3d(ctx0, q, head_dim, n_head, N);
     k = ggml_reshape_3d(ctx0, k, head_dim, n_head, N);
     v = ggml_reshape_3d(ctx0, v, head_dim, n_head, N);
@@ -151,7 +151,7 @@ ggml_tensor * clip_graph_fastvithd::mhsa(ggml_tensor * x, const fastvit_attn_blo
     return attn;
 }
 
-ggml_tensor * clip_graph_fastvithd::attn_block(ggml_tensor * x, const fastvit_attn_block & blk) {
+ggml_tensor * mtmd_graph_fastvithd::attn_block(ggml_tensor * x, const fastvit_attn_block & blk) {
     ggml_tensor * h = channel_norm(x, blk.norm_w, blk.norm_b);
     h               = mhsa(h, blk);
     h               = layer_scale(h, blk.ls1);
@@ -162,7 +162,7 @@ ggml_tensor * clip_graph_fastvithd::attn_block(ggml_tensor * x, const fastvit_at
     return ggml_add(ctx0, x, ffn);
 }
 
-ggml_tensor * clip_graph_fastvithd::downsample(ggml_tensor * x, const fastvit_conv2d & lkb, const fastvit_conv2d & pw) {
+ggml_tensor * mtmd_graph_fastvithd::downsample(ggml_tensor * x, const fastvit_conv2d & lkb, const fastvit_conv2d & pw) {
     // ReparamLargeKernelConv: DW 7x7 s2 p3 + GELU, then MobileOne 1x1 + GELU
     ggml_tensor * cur = conv2d(lkb, x, 2, 3, true);
     cur               = gelu_act(cur);
@@ -171,7 +171,7 @@ ggml_tensor * clip_graph_fastvithd::downsample(ggml_tensor * x, const fastvit_co
     return cur;
 }
 
-ggml_tensor * clip_graph_fastvithd::se_block(ggml_tensor * x) {
+ggml_tensor * mtmd_graph_fastvithd::se_block(ggml_tensor * x) {
     // Hard-coded avg pool 16x16 as in HF SEBlock. This assumes the 1024px / patch64
     // input (final feature map is 16x16); other resolutions hit the assert below.
     const int64_t W = x->ne[0];
@@ -187,7 +187,7 @@ ggml_tensor * clip_graph_fastvithd::se_block(ggml_tensor * x) {
     return ggml_mul(ctx0, x, cur);
 }
 
-ggml_cgraph * clip_graph_fastvithd::build() {
+ggml_cgraph * mtmd_graph_fastvithd::build() {
     ggml_tensor * cur = build_inp_raw();  // [W,H,3,B] = 1024x1024
 
     // convolutional stem: 3x3 s2, DW 3x3 s2, 1x1
