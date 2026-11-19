@@ -633,7 +633,7 @@ enum projector_type {
     PROJECTOR_TYPE_MUSE_SPARK_AUDIO,
     PROJECTOR_TYPE_CHATTERBOX,
     PROJECTOR_TYPE_CHATTERBOX_SPKENC,
-    PROJECTOR_TYPE_JINGYU,
+    PROJECTOR_TYPE_MARVIN_MUSE,
     PROJECTOR_TYPE_INKLING2V,
     PROJECTOR_TYPE_UNKNOWN,
 };
@@ -734,7 +734,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_MUSE_SPARK_AUDIO,  "muse-spark-audio"},
     { PROJECTOR_TYPE_CHATTERBOX,        "chatterbox"},
     { PROJECTOR_TYPE_CHATTERBOX_SPKENC, "chatterbox_spkenc"},
-    { PROJECTOR_TYPE_JINGYU,            "jingyu"},
+    { PROJECTOR_TYPE_MARVIN_MUSE,       "marvin_muse"},
     { PROJECTOR_TYPE_INKLING2V,         "inkling2v"},
 };
 

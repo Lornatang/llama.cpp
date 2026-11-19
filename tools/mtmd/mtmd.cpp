@@ -1059,9 +1059,9 @@ struct mtmd_context {
                         image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(models.v.get());
                     }
                 } break;
-            case PROJECTOR_TYPE_JINGYU:
+            case PROJECTOR_TYPE_MARVIN_MUSE:
                 {
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_jingyu>(models.v.get());
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_marvin_muse>(models.v.get());
                 } break;
             case PROJECTOR_TYPE_MINICPMV:
                 {

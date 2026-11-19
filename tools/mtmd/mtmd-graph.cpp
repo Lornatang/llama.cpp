@@ -766,7 +766,7 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
             {
                 builder = std::make_unique<mtmd_graph_mobilenetv5>(ctx, img);
             } break;
-        case PROJECTOR_TYPE_JINGYU:
+        case PROJECTOR_TYPE_MARVIN_MUSE:
             {
                 builder = std::make_unique<mtmd_graph_fastvithd>(ctx, img);
             } break;

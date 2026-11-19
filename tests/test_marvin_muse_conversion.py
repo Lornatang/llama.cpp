@@ -1,10 +1,10 @@
 # Copyright Larry. All Rights Reserved.
 # SPDX-License-Identifier: MIT
 # ==============================================================================
-"""Exercise Jingyu mmproj conversion without downloading model weights.
+"""Exercise Marvin Muse mmproj conversion without downloading model weights.
 
 The synthetic checkpoint uses the production block layout with smaller
-channels. Set ``JINGYU_MMPROJ_TEST`` to the path to ``test-mtmd-impl`` to also
+channels. Set ``MARVIN_MUSE_MMPROJ_TEST`` to the path to ``test-mtmd-impl`` to also
 load the F16 export and encode an image on the CPU.
 """
 
@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from safetensors.numpy import save_file
 
 from conversion.base import gguf
-from conversion.jingyu import JingyuVisionModel, _fuse_conv_bn
+from conversion.marvin_muse import MarvinMuseVisionModel, _fuse_conv_bn
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -86,7 +86,7 @@ def fixture_tensors():
     return tensors
 
 
-class TestJingyuConversion(unittest.TestCase):
+class TestMarvinMuseConversion(unittest.TestCase):
     """Check conversion and optionally run the exported projector on the CPU."""
 
     @classmethod
@@ -103,17 +103,17 @@ class TestJingyuConversion(unittest.TestCase):
             overrides (dict | None): Overrides for top-level model configuration keys.
         """
         config = {
-            "architectures": ["JingyuForConditionalGeneration"],
-            "model_type": "jingyu",
+            "architectures": ["MarvinMuseForConditionalGeneration"],
+            "model_type": "marvin_muse",
             "hidden_size": 32,
             "mm_hidden_size": 64,
             "num_hidden_layers": 1,
             "vision_config": {"layers": [2, 12, 24, 4, 2], "embed_dims": [4, 8, 16, 32, 32], "image_size": size, "patch_size": 64},
         }
         config.update(overrides or {})
-        (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        Path(directory, "config.json").write_text(json.dumps(config), encoding="utf-8")
         # Integer input exercises the converter's float32 GGUF metadata normalization.
-        (directory / "preprocessor_config.json").write_text(json.dumps({"image_mean": [0, 0, 0], "image_std": [1, 1, 1]}), encoding="utf-8")
+        Path(directory, "preprocessor_config.json").write_text(json.dumps({"image_mean": [0, 0, 0], "image_std": [1, 1, 1]}), encoding="utf-8")
         save_file(self.tensors if tensors is None else tensors, str(directory / "model.safetensors"))
 
     def convert(self, directory, outtype="f16"):
@@ -152,6 +152,7 @@ class TestJingyuConversion(unittest.TestCase):
                     result, output = self.convert(directory, outtype)
                     self.assertEqual(result.returncode, 0, result.stdout[-4000:])
                     reader = gguf.GGUFReader(output)
+                    self.assertEqual(reader.fields["clip.projector_type"].contents(), "marvin_muse")
                     tensors = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
                     self.assertEqual(tensors["mm.0.weight"], matrix_type)
                     self.assertEqual(tensors["v.fastvit.net.7.blk.0.qkv.weight"], matrix_type)
@@ -162,8 +163,8 @@ class TestJingyuConversion(unittest.TestCase):
                     for key in ("image_mean", "image_std"):
                         self.assertEqual(reader.fields[f"clip.vision.{key}"].types, [gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.FLOAT32])
                     del reader
-                    if outtype == "f16" and (runtime := os.environ.get("JINGYU_MMPROJ_TEST")):
-                        result = subprocess.run([runtime, "--jingyu-mmproj", str(output)], capture_output=True, text=True)
+                    if outtype == "f16" and (runtime := os.environ.get("MARVIN_MUSE_MMPROJ_TEST")):
+                        result = subprocess.run([runtime, "--marvin-muse-mmproj", str(output)], capture_output=True, text=True)
                         self.assertEqual(result.returncode, 0, result.stderr[-4000:])
 
     def test_incomplete_bn_and_missing_backbone_fail(self):
@@ -220,7 +221,7 @@ class TestJingyuConversion(unittest.TestCase):
         actual = F.conv2d(x, fused_w, fused_b, groups=4)
         torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
 
-        model = object.__new__(JingyuVisionModel)
+        model = object.__new__(MarvinMuseVisionModel)
         model._ffn_bn_buf = {}
         model._emitted_tensors = set()
         model._expected_shapes = {

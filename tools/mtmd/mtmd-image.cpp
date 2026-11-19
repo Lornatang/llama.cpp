@@ -823,7 +823,7 @@ mtmd_image_preproc_out mtmd_image_preprocessor_fixed_size::preprocess(const mtmd
     return output;
 }
 
-mtmd_image_preproc_out mtmd_image_preprocessor_jingyu::preprocess(const mtmd_image_u8 & img) const {
+mtmd_image_preproc_out mtmd_image_preprocessor_marvin_muse::preprocess(const mtmd_image_u8 & img) const {
     mtmd_image_u8 resized;
     const auto algo = static_cast<resize_algo>(RESIZE_ALGO_BICUBIC | RESIZE_ALGO_FLAG_TORCH);
     img_tool::resize_padded_square(img, resized, hparams.image_size, algo);

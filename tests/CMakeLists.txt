@@ -307,10 +307,10 @@ llama_test_cmd(python3
     ARGS -m unittest discover -s tests -p test_kv_cache_scales.py -v
 )
 llama_test_cmd(python3
-    NAME test-jingyu-conversion
+    NAME test-marvin-muse-conversion
     LABEL "python behavior"
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-    ARGS -m unittest discover -s tests -p test_jingyu_conversion.py -v
+    ARGS -m unittest discover -s tests -p test_marvin_muse_conversion.py -v
 )
 llama_build_and_test(test-json-schema.cpp  LABEL behavior)
 llama_build_and_test(test-chat-auto-parser.cpp  LABEL behavior  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -406,7 +406,7 @@ endif()
 llama_build_and_test(test-mtmd-c-api.c  LABEL behavior  LINK mtmd)
 
 llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd llama-common)
-set_property(TEST test-jingyu-conversion PROPERTY ENVIRONMENT "JINGYU_MMPROJ_TEST=$<TARGET_FILE:test-mtmd-impl>")
+set_property(TEST test-marvin-muse-conversion PROPERTY ENVIRONMENT "MARVIN_MUSE_MMPROJ_TEST=$<TARGET_FILE:test-mtmd-impl>")
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)

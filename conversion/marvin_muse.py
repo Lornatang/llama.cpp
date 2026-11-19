@@ -55,9 +55,9 @@ def _fuse_conv_bn(
     return fused_w, fused_b
 
 
-@ModelBase.register("JingyuForConditionalGeneration")
-class JingyuTextModel(Qwen3Model):
-    """Export only the Qwen3 language tower from a Jingyu checkpoint.
+@ModelBase.register("MarvinMuseForConditionalGeneration")
+class MarvinMuseTextModel(Qwen3Model):
+    """Export only the Qwen3 language tower from a Marvin Muse checkpoint.
 
     Attributes:
         model_arch (gguf.MODEL_ARCH): GGUF architecture tag, always Qwen3.
@@ -83,9 +83,9 @@ class JingyuTextModel(Qwen3Model):
         return super().filter_tensors((name, gen))
 
 
-@ModelBase.register("JingyuForConditionalGeneration")
-class JingyuVisionModel(MmprojModel):
-    """Export the Jingyu vision tower and MLP projector as an mmproj GGUF.
+@ModelBase.register("MarvinMuseForConditionalGeneration")
+class MarvinMuseVisionModel(MmprojModel):
+    """Export the Marvin Muse vision tower and MLP projector as an mmproj GGUF.
 
     Attributes:
         block_count (int): Synthetic block count for the mmproj tensor map.
@@ -98,7 +98,7 @@ class JingyuVisionModel(MmprojModel):
     _ffn_bn_buf: dict[str, dict[str, torch.Tensor]]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initialize the Jingyu vision converter and validate the checkpoint configuration.
+        """Initialize the Marvin Muse vision converter and validate the checkpoint configuration.
 
         Args:
             *args (Any): Positional arguments forwarded to ``MmprojModel``.
@@ -166,11 +166,11 @@ class JingyuVisionModel(MmprojModel):
         if self._ffn_bn_buf:
             needed = {"w", "bn_w", "bn_b", "mean", "var"}
             incomplete = [f"{key}: {', '.join(sorted(needed - set(parts)))}" for key, parts in sorted(self._ffn_bn_buf.items())]
-            raise ValueError(f"jingyu: incomplete ConvFFN batch normalization tensors: {'; '.join(incomplete)}")
+            raise ValueError(f"marvin_muse: incomplete ConvFFN batch normalization tensors: {'; '.join(incomplete)}")
         missing = sorted(self._expected_shapes.keys() - self._emitted_tensors)
         if missing:
             preview = ", ".join(missing[:10])
-            raise ValueError(f"jingyu: missing {len(missing)} required vision/projector tensors: {preview}")
+            raise ValueError(f"marvin_muse: missing {len(missing)} required vision/projector tensors: {preview}")
 
     def get_vision_config(self) -> Dict[str, Any] | None:
         """Fill the generic vision metadata required by ``MmprojModel``.
@@ -215,7 +215,7 @@ class JingyuVisionModel(MmprojModel):
         ):
             for key, value in expected.items():
                 if config.get(key, value) != value:
-                    raise ValueError(f"jingyu: unsupported {key}={config[key]!r}; expected {value!r}")
+                    raise ValueError(f"marvin_muse: unsupported {key}={config[key]!r}; expected {value!r}")
 
         self._widths = tuple(cfg_vision.get("embed_dims", _WIDTHS))
         if (len(self._widths) != len(_STAGES)
@@ -223,7 +223,7 @@ class JingyuVisionModel(MmprojModel):
                 or any(b % a for a, b in zip(self._widths, self._widths[1:]))
                 or any(c % 32 for c in self._widths[3:])
                 or cfg_vision["hidden_size"] != 2 * self._widths[-1]):
-            raise ValueError(f"jingyu: incompatible embed_dims {self._widths} and mm_hidden_size {cfg_vision['hidden_size']}")
+            raise ValueError(f"marvin_muse: incompatible embed_dims {self._widths} and mm_hidden_size {cfg_vision['hidden_size']}")
 
         # GGUF infers array element types from Python values. The loader expects float32.
         for key, default in (("image_mean", 0.0), ("image_std", 1.0)):
@@ -231,13 +231,13 @@ class JingyuVisionModel(MmprojModel):
             if not isinstance(values, (list, tuple)) or len(values) != 3 or not all(
                 type(v) in (int, float) and math.isfinite(v) and (key != "image_std" or v > 0) for v in values
             ):
-                raise ValueError(f"jingyu: invalid {key}={values!r}; expected three finite RGB values and positive std")
+                raise ValueError(f"marvin_muse: invalid {key}={values!r}; expected three finite RGB values and positive std")
             self.preprocessor_config[key] = [float(v) for v in values]
 
     def set_gguf_parameters(self) -> None:
-        """Write the generic vision metadata and Jingyu's projector settings."""
+        """Write the generic vision metadata and Marvin Muse's projector settings."""
         super().set_gguf_parameters()
-        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.JINGYU)
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.MARVIN_MUSE)
         self.gguf_writer.add_vision_use_gelu(True)
         self.gguf_writer.add_vision_attention_layernorm_eps(1e-5)
 
@@ -295,7 +295,7 @@ class JingyuVisionModel(MmprojModel):
             if weight_shape is not None:
                 shape = (weight_shape[0],)
         if shape is None or tuple(data.shape) != shape:
-            raise ValueError(f"jingyu: unexpected tensor {name} with shape {tuple(data.shape)}; expected {shape}")
+            raise ValueError(f"marvin_muse: unexpected tensor {name} with shape {tuple(data.shape)}; expected {shape}")
         if required:
             self._emitted_tensors.add(name)
         yield name, data.contiguous()
@@ -458,7 +458,7 @@ class JingyuVisionModel(MmprojModel):
                     param = "weight" if part == "w" else "bias"
                     shape = self._expected_shapes.get(f"{prefix}.{param}")
                     if tuple(buf[part].shape) != shape:
-                        raise ValueError(f"jingyu: unexpected shape {tuple(buf[part].shape)} for {prefix} {part}; expected {shape}")
+                        raise ValueError(f"marvin_muse: unexpected shape {tuple(buf[part].shape)} for {prefix} {part}; expected {shape}")
                 fw, fb = _fuse_conv_bn(buf["w"], buf["bn_w"], buf["bn_b"], buf["mean"], buf["var"])
                 yield from self._emit(f"{prefix}.weight", fw)
                 yield from self._emit(f"{prefix}.bias", fb)
@@ -471,7 +471,7 @@ class JingyuVisionModel(MmprojModel):
         Args:
             data_torch (torch.Tensor): Source tensor from the checkpoint.
             name (str): Checkpoint tensor name.
-            bid (int | None): Block index from the base converter. Unused for Jingyu vision export.
+            bid (int | None): Block index from the base converter. Unused for Marvin Muse vision export.
 
         Yields:
             Tuple[str, torch.Tensor]: Mapped pairs for retained vision and projector tensors.

@@ -132,9 +132,9 @@ struct mtmd_image_preprocessor_fixed_size : mtmd_image_preprocessor {
     mtmd_image_preproc_out preprocess(const mtmd_image_u8 & img) const override;
 };
 
-struct mtmd_image_preprocessor_jingyu : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_jingyu(const mtmd_model * model) : mtmd_image_preprocessor(model) {}
-    mtmd_image_preprocessor_jingyu(const mtmd_hparams & hparams) : mtmd_image_preprocessor(hparams) {}
+struct mtmd_image_preprocessor_marvin_muse : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_marvin_muse(const mtmd_model * model) : mtmd_image_preprocessor(model) {}
+    mtmd_image_preprocessor_marvin_muse(const mtmd_hparams & hparams) : mtmd_image_preprocessor(hparams) {}
     mtmd_image_preproc_out preprocess(const mtmd_image_u8 & img) const override;
 };
 

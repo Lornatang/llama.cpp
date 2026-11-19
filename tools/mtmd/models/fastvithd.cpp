@@ -15,7 +15,7 @@
 //  fastvithd.cpp
 //  llama.cpp / mtmd
 //
-//  Loads Jingyu FastViT-HD weights and builds the ggml graph from RGB input
+//  Loads Marvin Muse FastViT-HD weights and builds the ggml graph from RGB input
 //  to projected image tokens.
 //
 
@@ -30,7 +30,7 @@ void load_fastvithd(mtmd_model & model, const std::function<ggml_tensor *(const 
     auto & weights = model.fastvit;
     auto check_shape = [](const ggml_tensor * t, const std::array<int64_t, 4> & shape) {
         if (t && !std::equal(shape.begin(), shape.end(), t->ne)) {
-            throw std::runtime_error(mtmd_format("jingyu: unexpected shape for %s; expected [%lld, %lld, %lld, %lld]",
+            throw std::runtime_error(mtmd_format("marvin_muse: unexpected shape for %s; expected [%lld, %lld, %lld, %lld]",
                 t->name, (long long) shape[0], (long long) shape[1], (long long) shape[2], (long long) shape[3]));
         }
     };
@@ -44,14 +44,14 @@ void load_fastvithd(mtmd_model & model, const std::function<ggml_tensor *(const 
         const int64_t channels = out > 0 ? out : w->ne[3];
         check_shape(w, {kernel, kernel, in, channels});
         if (w->type != GGML_TYPE_F16 && w->type != GGML_TYPE_F32) {
-            throw std::runtime_error("jingyu: convolution requires F16 or F32 weights: " + name);
+            throw std::runtime_error("marvin_muse: convolution requires F16 or F32 weights: " + name);
         }
         return fastvit_conv2d{w, get(name + ".bias", {channels, 1, 1, 1}, false)};
     };
     auto load_scale = [&](const std::string & name, int64_t channels) {
         auto * t = get_tensor(name + ".weight", true);
         if (ggml_nelements(t) != channels) {
-            throw std::runtime_error("jingyu: incompatible channel count for " + name + ".weight");
+            throw std::runtime_error("marvin_muse: incompatible channel count for " + name + ".weight");
         }
         return t;
     };
@@ -85,7 +85,7 @@ void load_fastvithd(mtmd_model & model, const std::function<ggml_tensor *(const 
             }
         } else {
             if (c % 32 != 0) {
-                throw std::runtime_error("jingyu: attention requires channels divisible by 32");
+                throw std::runtime_error("marvin_muse: attention requires channels divisible by 32");
             }
             weights.pos[i - 3] = load_conv(mtmd_format("v.fastvit.net.%d.pos", pos_net[i - 3]), 7, 1, c);
             auto & blocks = weights.attention[i - 3];
@@ -109,7 +109,7 @@ void load_fastvithd(mtmd_model & model, const std::function<ggml_tensor *(const 
             weights.down[i][0] = load_conv(base + "0", 7, 1);
             const int64_t depthwise_channels = weights.down[i][0].w->ne[3];
             if (depthwise_channels % c != 0) {
-                throw std::runtime_error("jingyu: incompatible depthwise channel count for " + base + "0.weight");
+                throw std::runtime_error("marvin_muse: incompatible depthwise channel count for " + base + "0.weight");
             }
             weights.down[i][1] = load_conv(base + "1", 1, depthwise_channels);
             c = weights.down[i][1].w->ne[3];
@@ -121,7 +121,7 @@ void load_fastvithd(mtmd_model & model, const std::function<ggml_tensor *(const 
     weights.se_reduce = load_conv("v.fastvit.conv_exp.se.reduce", 1, vision_dim);
     weights.se_expand = load_conv("v.fastvit.conv_exp.se.expand", 1, weights.se_reduce.w->ne[3], vision_dim);
     if (get_tensor("mm.4.weight", false) || get_tensor("mm.4.bias", false)) {
-        throw std::runtime_error("jingyu: expected a two-layer multimodal projector");
+        throw std::runtime_error("marvin_muse: expected a two-layer multimodal projector");
     }
     const int64_t text_dim = model.hparams.projection_dim;
     model.mm_0_w = get("mm.0.weight", {vision_dim, text_dim, 1, 1});

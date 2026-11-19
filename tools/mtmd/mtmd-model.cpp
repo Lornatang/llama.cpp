@@ -312,10 +312,10 @@ struct mtmd_model_loader {
                             hparams.image_pad_color_rf   = {122, 116, 104};
                         }
                     } break;
-                case PROJECTOR_TYPE_JINGYU:
+                case PROJECTOR_TYPE_MARVIN_MUSE:
                     {
                         if (hparams.patch_size != 64 || hparams.image_size <= 0 || hparams.image_size % 64 != 0) {
-                            throw std::runtime_error(mtmd_format("%s: Jingyu requires patch_size 64 and a positive image_size divisible by 64\n", __func__));
+                            throw std::runtime_error(mtmd_format("%s: Marvin Muse requires patch_size 64 and a positive image_size divisible by 64\n", __func__));
                         }
                     } break;
                 case PROJECTOR_TYPE_GLM_EDGE:
@@ -1583,7 +1583,7 @@ struct mtmd_model_loader {
         const bool has_patch_embd = (
             model.modality  == MTMD_MODALITY_VISION &&
             model.proj_type != PROJECTOR_TYPE_GEMMA3NV &&
-            model.proj_type != PROJECTOR_TYPE_JINGYU &&
+            model.proj_type != PROJECTOR_TYPE_MARVIN_MUSE &&
             model.proj_type != PROJECTOR_TYPE_DEEPSEEKOCR &&
             model.proj_type != PROJECTOR_TYPE_DEEPSEEKOCR2);
 
@@ -1601,7 +1601,7 @@ struct mtmd_model_loader {
 
         const bool has_standard_layers = (
             model.proj_type != PROJECTOR_TYPE_GEMMA3NV &&
-            model.proj_type != PROJECTOR_TYPE_JINGYU &&
+            model.proj_type != PROJECTOR_TYPE_MARVIN_MUSE &&
             model.proj_type != PROJECTOR_TYPE_QWEN3TTS_SPKENC &&
             model.proj_type != PROJECTOR_TYPE_ZONOS3_SPKENC &&
             model.proj_type != PROJECTOR_TYPE_POCKETTTS_GEN &&
@@ -1876,7 +1876,7 @@ struct mtmd_model_loader {
                     }
                     model.image_newline = get_tensor(TN_IMAGE_NEWLINE, false);
                 } break;
-            case PROJECTOR_TYPE_JINGYU:
+            case PROJECTOR_TYPE_MARVIN_MUSE:
                 load_fastvithd(model, get_tensor);
                 break;
             case PROJECTOR_TYPE_LDP:
@@ -4701,7 +4701,7 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
         case PROJECTOR_TYPE_MLP_NORM:
         case PROJECTOR_TYPE_JANUS_PRO:
         case PROJECTOR_TYPE_PHI4:
-        case PROJECTOR_TYPE_JINGYU:
+        case PROJECTOR_TYPE_MARVIN_MUSE:
             {
                 // do nothing
             } break;
@@ -5098,7 +5098,7 @@ int mtmd_model::n_mmproj_embd() const {
         case PROJECTOR_TYPE_DOTS_OCR:
         case PROJECTOR_TYPE_DOTS3NOTE_V:
         case PROJECTOR_TYPE_DOTS3NOTE_A:
-        case PROJECTOR_TYPE_JINGYU:
+        case PROJECTOR_TYPE_MARVIN_MUSE:
             return mm_2_w->ne[1];
         case PROJECTOR_TYPE_MLP_NORM:
             return mm_3_b->ne[0];
