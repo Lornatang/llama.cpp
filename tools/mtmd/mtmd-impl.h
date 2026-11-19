@@ -520,24 +520,6 @@
 #define TN_YASA_STAGE_DOWN_CONV  "v.stage.%d.down.conv.%s"
 #define TN_YASA_STAGE_BLK        "v.stage.%d.blk.%d.%s.%s"
 
-// Jingyu
-#define TN_FV_STEM          "v.fastvit.stem.%d.%s"
-#define TN_FV_NET_MIXER     "v.fastvit.net.%d.blk.%d.mixer.%s"
-#define TN_FV_NET_LS        "v.fastvit.net.%d.blk.%d.ls.weight"
-#define TN_FV_NET_LS1       "v.fastvit.net.%d.blk.%d.ls1.weight"
-#define TN_FV_NET_LS2       "v.fastvit.net.%d.blk.%d.ls2.weight"
-#define TN_FV_NET_NORM      "v.fastvit.net.%d.blk.%d.norm.%s"
-#define TN_FV_NET_QKV       "v.fastvit.net.%d.blk.%d.qkv.%s"
-#define TN_FV_NET_PROJ      "v.fastvit.net.%d.blk.%d.proj.%s"
-#define TN_FV_NET_FFN_DW    "v.fastvit.net.%d.blk.%d.ffn.dw.%s"
-#define TN_FV_NET_FFN_FC1   "v.fastvit.net.%d.blk.%d.ffn.fc1.%s"
-#define TN_FV_NET_FFN_FC2   "v.fastvit.net.%d.blk.%d.ffn.fc2.%s"
-#define TN_FV_NET_DOWN      "v.fastvit.net.%d.down.%d.%s"
-#define TN_FV_NET_POS       "v.fastvit.net.%d.pos.%s"
-#define TN_FV_CONV_EXP      "v.fastvit.conv_exp.%s"
-#define TN_FV_CONV_EXP_SE_R "v.fastvit.conv_exp.se.reduce.%s"
-#define TN_FV_CONV_EXP_SE_E "v.fastvit.conv_exp.se.expand.%s"
-
 // parakeet
 #define TN_MEL_FILTERS           "a.mel_filters"
 #define TN_WINDOW                "a.window"

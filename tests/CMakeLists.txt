@@ -406,6 +406,7 @@ endif()
 llama_build_and_test(test-mtmd-c-api.c  LABEL behavior  LINK mtmd)
 
 llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd llama-common)
+set_property(TEST test-jingyu-conversion PROPERTY ENVIRONMENT "JINGYU_MMPROJ_TEST=$<TARGET_FILE:test-mtmd-impl>")
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)

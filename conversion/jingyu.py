@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import math
 import re
 from typing import Any, Callable, Dict, Iterable, Tuple
 
@@ -18,6 +19,9 @@ import torch
 
 from .base import MmprojModel, ModelBase, gguf, logger
 from .qwen import Qwen3Model
+
+_STAGES = ((0, 2), (2, 12), (4, 24), (7, 4), (10, 2))
+_WIDTHS = (96, 192, 384, 768, 1536)
 
 
 def _fuse_conv_bn(
@@ -39,9 +43,11 @@ def _fuse_conv_bn(
         eps (float): BatchNorm epsilon used in the variance denominator. Defaults to ``1e-5``.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]: ``(fused_weight, fused_bias)`` where ``fused_weight`` keeps the conv layout and ``fused_bias`` has shape
-        ``[out_c]``. Suitable for inference without a separate BN op.
+        Tuple[torch.Tensor, torch.Tensor]: Float32 convolution weights in the original layout and a bias of shape ``[out_c]``.
     """
+    weight, bn_weight, bn_bias, running_mean, running_var = (
+        t.to(torch.float32) for t in (weight, bn_weight, bn_bias, running_mean, running_var)
+    )
     std = (running_var + eps).sqrt()
     scale = (bn_weight / std).reshape(-1, 1, 1, 1)
     fused_w = weight * scale
@@ -61,16 +67,13 @@ class JingyuTextModel(Qwen3Model):
 
     @classmethod
     def filter_tensors(cls, item: Tuple[str, Callable[[], torch.Tensor]]) -> Tuple[str, Callable[[], torch.Tensor]] | None:
-        """Keep language-model tensors; drop vision and projector weights.
-
-        Also strips the ``language_model.`` prefix so names match the Qwen3 converter expectations.
+        """Select the tensors handled by the Qwen3 text converter.
 
         Args:
             item (Tuple[str, Callable[[], torch.Tensor]]): Checkpoint pair ``(tensor_name, lazy_loader)``.
 
         Returns:
-            Tuple[str, Callable[[], torch.Tensor]] | None: The possibly renamed pair for export, or ``None`` when the tensor belongs to
-            ``vision_tower`` / ``mm_projector`` and must be skipped.
+            Tuple[str, Callable[[], torch.Tensor]] | None: The pair with any ``language_model.`` prefix removed, or ``None`` for discarded tensors.
         """
         name, gen = item
         if "vision_tower" in name or "mm_projector" in name:
@@ -87,136 +90,156 @@ class JingyuVisionModel(MmprojModel):
     Attributes:
         block_count (int): Synthetic block count for the mmproj tensor map.
         tensor_map: GGUF tensor name map for ``MODEL_ARCH.MMPROJ``.
-        _ffn_bn_buf (dict[str, dict[str, torch.Tensor]]): Per-block buffer that accumulates ConvFFN depthwise conv and BatchNorm pieces until they can
-        be fused.
+        _ffn_bn_buf (dict[str, dict[str, torch.Tensor]]): Per-block buffer for ConvFFN convolution and batch normalization tensors.
+        _expected_shapes (dict[str, tuple[int, ...]]): PyTorch dimension order for each required GGUF tensor.
+        _emitted_tensors (set[str]): Required tensor names already emitted by the converter.
     """
 
     _ffn_bn_buf: dict[str, dict[str, torch.Tensor]]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initialize vision export state and an empty BN fusion buffer.
+        """Initialize the Jingyu vision converter and validate the checkpoint configuration.
 
         Args:
-            *args (Any): Positional args forwarded to ``MmprojModel``.
+            *args (Any): Positional arguments forwarded to ``MmprojModel``.
             **kwargs (Any): Keyword args forwarded to ``MmprojModel``.
 
-        Returns:
-            None
+        Raises:
+            ValueError: If the model architecture or preprocessing configuration is unsupported.
         """
         super().__init__(*args, **kwargs)
-        self.block_count = 1
-        self.tensor_map = gguf.get_tensor_name_map(gguf.MODEL_ARCH.MMPROJ, self.block_count)
         self._ffn_bn_buf = {}
+        self._validate_config()
+        self._expected_shapes = self._tensor_shapes()
         self._emitted_tensors: set[str] = set()
 
-    @staticmethod
-    def _required_tensors() -> set[str]:
-        required = {f"v.fastvit.stem.{i}.{param}" for i in range(3) for param in ("weight", "bias")}
-        for net, count in ((0, 2), (2, 12), (4, 24), (7, 4), (10, 2)):
+    def _tensor_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Build the tensor shape requirements for the configured FastViT-HD widths.
+
+        Returns:
+            dict[str, tuple[int, ...]]: Required GGUF tensor names mapped to shapes in PyTorch dimension order.
+        """
+        shapes: dict[str, tuple[int, ...]] = {}
+
+        def affine(name: str, shape: tuple[int, ...]) -> None:
+            shapes[name + ".weight"] = shape
+            shapes[name + ".bias"] = (shape[0],)
+
+        c0 = self._widths[0]
+        affine("v.fastvit.stem.0", (c0, 3, 3, 3))
+        affine("v.fastvit.stem.1", (c0, 1, 3, 3))
+        affine("v.fastvit.stem.2", (c0, c0, 1, 1))
+        for (net, count), c in zip(_STAGES, self._widths, strict=True):
             for block in range(count):
                 prefix = f"v.fastvit.net.{net}.blk.{block}"
-                required.update(f"{prefix}.ffn.{part}.{param}" for part in ("dw", "fc1", "fc2") for param in ("weight", "bias"))
+                affine(f"{prefix}.ffn.dw", (c, 1, 7, 7))
+                affine(f"{prefix}.ffn.fc1", (4 * c, c, 1, 1))
+                affine(f"{prefix}.ffn.fc2", (c, 4 * c, 1, 1))
                 if net in (0, 2, 4):
-                    required.update((f"{prefix}.mixer.weight", f"{prefix}.mixer.bias", f"{prefix}.ls.weight"))
+                    affine(f"{prefix}.mixer", (c, 1, 3, 3))
+                    shapes[f"{prefix}.ls.weight"] = (c, 1, 1)
                 else:
-                    required.update(f"{prefix}.{part}.weight" for part in ("norm", "qkv", "proj", "ls1", "ls2"))
-                    required.update((f"{prefix}.norm.bias", f"{prefix}.proj.bias"))
-        required.update(f"v.fastvit.net.{net}.down.{part}.{param}"
-                        for net in (1, 3, 5, 8) for part in range(2) for param in ("weight", "bias"))
-        required.update(f"v.fastvit.net.{net}.pos.{param}" for net in (6, 9) for param in ("weight", "bias"))
-        required.update(f"v.fastvit.conv_exp.{part}{param}"
-                        for part in ("", "se.reduce.", "se.expand.") for param in ("weight", "bias"))
-        required.update(f"mm.{i}.{param}" for i in (0, 2) for param in ("weight", "bias"))
-        return required
+                    affine(f"{prefix}.norm", (c,))
+                    shapes[f"{prefix}.qkv.weight"] = (3 * c, c)
+                    affine(f"{prefix}.proj", (c, c))
+                    shapes[f"{prefix}.ls1.weight"] = shapes[f"{prefix}.ls2.weight"] = (c, 1, 1)
+        for net, c in zip((1, 3, 5, 8), self._widths[1:], strict=True):
+            affine(f"v.fastvit.net.{net}.down.0", (c, 1, 7, 7))
+            affine(f"v.fastvit.net.{net}.down.1", (c, c, 1, 1))
+        for net, c in zip((6, 9), self._widths[3:], strict=True):
+            affine(f"v.fastvit.net.{net}.pos", (c, 1, 7, 7))
+        vision_dim = 2 * self._widths[-1]
+        affine("v.fastvit.conv_exp", (vision_dim, 1, 3, 3))
+        affine("v.fastvit.conv_exp.se.reduce", (vision_dim // 16, vision_dim, 1, 1))
+        affine("v.fastvit.conv_exp.se.expand", (vision_dim, vision_dim // 16, 1, 1))
+        affine("mm.0", (self.n_embd_text, vision_dim))
+        affine("mm.2", (self.n_embd_text, self.n_embd_text))
+        return shapes
 
     def prepare_tensors(self) -> None:
+        """Prepare the vision and projector tensors and check that the export is complete.
+
+        Raises:
+            ValueError: If a mapped tensor has an invalid shape or a required tensor or batch normalization parameter is missing.
+        """
         super().prepare_tensors()
         if self._ffn_bn_buf:
             needed = {"w", "bn_w", "bn_b", "mean", "var"}
             incomplete = [f"{key}: {', '.join(sorted(needed - set(parts)))}" for key, parts in sorted(self._ffn_bn_buf.items())]
             raise ValueError(f"jingyu: incomplete ConvFFN batch normalization tensors: {'; '.join(incomplete)}")
-        missing = sorted(self._required_tensors() - self._emitted_tensors)
+        missing = sorted(self._expected_shapes.keys() - self._emitted_tensors)
         if missing:
             preview = ", ".join(missing[:10])
             raise ValueError(f"jingyu: missing {len(missing)} required vision/projector tensors: {preview}")
 
     def get_vision_config(self) -> Dict[str, Any] | None:
-        """Build a vision hyperparameter dict for MmprojModel helpers.
-
-        Fills synthetic keys (layer counts, head count, sizes) required by the base loader when the Hugging Face config omits them.
+        """Fill the generic vision metadata required by ``MmprojModel``.
 
         Returns:
-            Dict[str, Any] | None: Vision config dictionary. Never ``None`` for a valid Jingyu checkpoint; the ``| None`` matches the base-class
-            signature.
+            Dict[str, Any] | None: A copy of the vision config with the converter's dimension metadata and defaults.
         """
         cfg = dict(self.global_config.get("vision_config") or {})
-        # Synthetic keys so MmprojModel.__init__ / find_vparam succeed.
-        cfg.setdefault("n_layers", 1)
-        cfg.setdefault("num_hidden_layers", 1)
-        cfg["hidden_size"] = int(self.global_config.get("mm_hidden_size", cfg.get("hidden_size", 3072)))
-        cfg.setdefault("intermediate_size", int(self.global_config.get("mm_hidden_size", 3072)))
-        cfg.setdefault("num_attention_heads", max(1, cfg["hidden_size"] // 32))
+        # The generic CLIP block count satisfies the metadata schema. FastViT stages are loaded separately.
+        cfg["n_layers"] = 1
+        cfg["hidden_size"] = int(self.global_config.get("mm_hidden_size", 3072))
+        cfg["intermediate_size"] = cfg["hidden_size"]
+        cfg["num_attention_heads"] = max(1, cfg["hidden_size"] // 32)
         cfg.setdefault("image_size", 1024)
         cfg.setdefault("patch_size", 64)
         return cfg
 
-    def set_gguf_parameters(self) -> None:
-        """Write Jingyu mmproj metadata expected by the C++ clip loader.
+    def _validate_config(self) -> None:
+        """Validate the FastViT-HD graph settings and normalize the RGB statistics.
 
-        Writes projector type, image/patch sizes, embedding dims and normalization stats, then validates that the
-        checkpoint architecture matches the constants hard-coded in the C++ FastViT-HD graph.
-
-        Returns:
-            None
+        Raises:
+            ValueError: If the runtime does not support the model or preprocessing configuration.
         """
-        self.gguf_writer.add_file_type(self.ftype)
-        self.gguf_writer.add_clip_has_vision_encoder(True)
-        self.gguf_writer.add_vision_projection_dim(self.n_embd_text)
-        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.JINGYU)
-
-        image_size = int((self.hparams_vision or {}).get("image_size", 1024))
-        patch_size = int((self.hparams_vision or {}).get("patch_size", 64))
-        vision_dim = int(self.global_config.get("mm_hidden_size", 3072))
-
-        self.gguf_writer.add_vision_image_size(image_size)
-        self.gguf_writer.add_vision_patch_size(patch_size)
-        self.gguf_writer.add_vision_embedding_length(vision_dim)
-        self.gguf_writer.add_vision_feed_forward_length(vision_dim)
-        self.gguf_writer.add_vision_block_count(1)
-        self.gguf_writer.add_vision_head_count(max(1, vision_dim // 32))
-        self.gguf_writer.add_vision_use_gelu(True)
-        # Required by clip_model_loader::load_hparams; unused by ChannelNorm.
-        self.gguf_writer.add_vision_attention_layernorm_eps(1e-5)
-
-        mean = self.preprocessor_config.get("image_mean", [0.0, 0.0, 0.0])
-        std = self.preprocessor_config.get("image_std", [1.0, 1.0, 1.0])
-        self.gguf_writer.add_vision_image_mean(mean)
-        self.gguf_writer.add_vision_image_std(std)
-
-        # The C++ FastViT-HD graph hard-codes the stage layout and embed dims.
-        # Reject mismatching checkpoints instead of writing a
-        # file that silently produces wrong embeddings or aborts at load time.
-        expected_layers = [2, 12, 24, 4, 2]
-        expected_embed_dims = [96, 192, 384, 768, 1536]
         cfg_vision = self.hparams_vision or {}
-        layers = [int(v) for v in cfg_vision.get("layers", expected_layers)]
-        embed_dims = [int(v) for v in cfg_vision.get("embed_dims", expected_embed_dims)]
+        for config, expected in (
+            (self.global_config, {
+                "mm_projector_type": "mlp2x_gelu", "mm_patch_merge_type": "flat", "image_aspect_ratio": "pad",
+            }),
+            (cfg_vision, {
+                "model_type": "fastvithd", "image_size": 1024, "patch_size": 64, "num_channels": 3,
+                "inference_mode": True, "layers": [count for _, count in _STAGES],
+                "token_mixers": ["repmixer", "repmixer", "repmixer", "attention", "attention"],
+                "down_patch_size": 7, "down_stride": 2, "downsamples": [True] * 5,
+                "repmixer_kernel_size": 3, "mlp_ratios": [4] * 5, "cls_ratio": 2.0,
+                "pos_embs_shapes": [None, None, None, [7, 7], [7, 7]],
+            }),
+            (self.preprocessor_config, {
+                "size": {"shortest_edge": 1024}, "crop_size": {"height": 1024, "width": 1024},
+                "do_resize": True, "do_rescale": True, "do_normalize": True, "do_pad": False,
+                "resample": 3, "rescale_factor": 1 / 255,
+            }),
+        ):
+            for key, value in expected.items():
+                if config.get(key, value) != value:
+                    raise ValueError(f"jingyu: unsupported {key}={config[key]!r}; expected {value!r}")
 
-        if image_size <= 0 or image_size % 64 != 0 or patch_size != 64:
-            raise ValueError(f"jingyu: unsupported image_size={image_size} patch_size={patch_size}; image_size must be a positive multiple of 64 and patch_size must be 64")
-        if layers != expected_layers:
-            raise ValueError(f"jingyu: unsupported layer layout {layers}, expected {expected_layers}")
-        if embed_dims != expected_embed_dims:
-            raise ValueError(f"jingyu: unsupported embed_dims {embed_dims}, expected {expected_embed_dims}")
+        self._widths = tuple(cfg_vision.get("embed_dims", _WIDTHS))
+        if (len(self._widths) != len(_STAGES)
+                or any(not isinstance(c, int) or c <= 0 for c in self._widths)
+                or any(b % a for a, b in zip(self._widths, self._widths[1:]))
+                or any(c % 32 for c in self._widths[3:])
+                or cfg_vision["hidden_size"] != 2 * self._widths[-1]):
+            raise ValueError(f"jingyu: incompatible embed_dims {self._widths} and mm_hidden_size {cfg_vision['hidden_size']}")
 
-        logger.info(
-            "Jingyu mmproj: projector=jingyu image=%dx%d patch=%d vision_dim=%d text_dim=%d",
-            image_size,
-            image_size,
-            patch_size,
-            vision_dim,
-            self.n_embd_text,
-        )
+        # GGUF infers array element types from Python values. The loader expects float32.
+        for key, default in (("image_mean", 0.0), ("image_std", 1.0)):
+            values = self.preprocessor_config.get(key, [default] * 3)
+            if not isinstance(values, (list, tuple)) or len(values) != 3 or not all(
+                type(v) in (int, float) and math.isfinite(v) and (key != "image_std" or v > 0) for v in values
+            ):
+                raise ValueError(f"jingyu: invalid {key}={values!r}; expected three finite RGB values and positive std")
+            self.preprocessor_config[key] = [float(v) for v in values]
+
+    def set_gguf_parameters(self) -> None:
+        """Write the generic vision metadata and Jingyu's projector settings."""
+        super().set_gguf_parameters()
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.JINGYU)
+        self.gguf_writer.add_vision_use_gelu(True)
+        self.gguf_writer.add_vision_attention_layernorm_eps(1e-5)
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
         """Keep convolution kernels compatible with ggml backends.
@@ -228,7 +251,7 @@ class JingyuVisionModel(MmprojModel):
             n_dims (int): Number of dimensions of the tensor.
 
         Returns:
-            gguf.GGMLQuantizationType | bool: A convolution-compatible type, or the base-class policy for other tensors.
+            gguf.GGMLQuantizationType | bool: F16 or F32 for convolution weights, F32 for layer scales, or the base-class policy.
         """
         if new_name.startswith("v.fastvit.") or new_name.startswith("mm."):
             if n_dims == 4:
@@ -245,8 +268,7 @@ class JingyuVisionModel(MmprojModel):
             item (Tuple[str, Callable[[], torch.Tensor]]): Checkpoint pair ``(tensor_name, lazy_loader)``.
 
         Returns:
-            Tuple[str, Callable[[], torch.Tensor]] | None: The original pair when ``tensor_name`` contains ``vision_tower`` or ``mm_projector``;
-            otherwise ``None``.
+            Tuple[str, Callable[[], torch.Tensor]] | None: The original pair for a vision or projector tensor, otherwise ``None``.
         """
         name, gen = item
         if "vision_tower" in name or "mm_projector" in name:
@@ -254,17 +276,29 @@ class JingyuVisionModel(MmprojModel):
         return None
 
     def _emit(self, name: str, data: torch.Tensor) -> Iterable[Tuple[str, torch.Tensor]]:
-        """Yield a contiguous float32 tensor under the given GGUF name.
+        """Validate a mapped tensor and record it if required.
 
         Args:
             name (str): Destination GGUF tensor name.
-            data (torch.Tensor): Source tensor of any dtype/layout.
+            data (torch.Tensor): Mapped tensor in PyTorch dimension order.
 
         Yields:
-            Tuple[str, torch.Tensor]: ``(name, float32_contiguous_tensor)``.
+            Tuple[str, torch.Tensor]: The destination name and contiguous tensor.
+
+        Raises:
+            ValueError: If the tensor name or shape is incompatible with the graph.
         """
-        self._emitted_tensors.add(name)
-        yield name, data.contiguous().to(torch.float32)
+        shape = self._expected_shapes.get(name)
+        required = shape is not None
+        if shape is None and name.endswith(".qkv.bias"):
+            weight_shape = self._expected_shapes.get(name.removesuffix("bias") + "weight")
+            if weight_shape is not None:
+                shape = (weight_shape[0],)
+        if shape is None or tuple(data.shape) != shape:
+            raise ValueError(f"jingyu: unexpected tensor {name} with shape {tuple(data.shape)}; expected {shape}")
+        if required:
+            self._emitted_tensors.add(name)
+        yield name, data.contiguous()
 
     def _map_projector(self, name: str, data: torch.Tensor) -> Iterable[Tuple[str, torch.Tensor]]:
         """Map ``mm_projector.{i}.{weight,bias}`` to ``mm.{i}.{weight,bias}``.
@@ -274,7 +308,10 @@ class JingyuVisionModel(MmprojModel):
             data (torch.Tensor): Source tensor.
 
         Yields:
-            Tuple[str, torch.Tensor]: Mapped projector tensor when ``name`` matches the projector pattern; otherwise yields nothing.
+            Tuple[str, torch.Tensor]: Mapped projector tensor when ``name`` matches the projector pattern.
+
+        Raises:
+            ValueError: If the matched tensor is incompatible with the projector graph.
         """
         m = re.match(r".*mm_projector\.(\d+)\.(weight|bias)$", name)
         if not m:
@@ -289,8 +326,10 @@ class JingyuVisionModel(MmprojModel):
             data (torch.Tensor): Source tensor.
 
         Yields:
-            Tuple[str, torch.Tensor]: Mapped stem tensor when ``name`` matches ``patch_embed.{i}.reparam_conv.{weight|bias}``; otherwise yields
-            nothing.
+            Tuple[str, torch.Tensor]: Mapped stem tensor when ``name`` matches ``patch_embed.{i}.reparam_conv.{weight|bias}``.
+
+        Raises:
+            ValueError: If the matched tensor is incompatible with the stem.
         """
         m = re.match(r".*patch_embed\.(\d+)\.reparam_conv\.(weight|bias)$", name)
         if m:
@@ -304,8 +343,10 @@ class JingyuVisionModel(MmprojModel):
             data (torch.Tensor): Source tensor.
 
         Yields:
-            Tuple[str, torch.Tensor]: Mapped ``v.fastvit.conv_exp.*`` tensor when ``name`` matches a known conv_exp / SE path; otherwise yields
-            nothing.
+            Tuple[str, torch.Tensor]: Mapped ``v.fastvit.conv_exp.*`` tensor when ``name`` matches a known convolution or SE parameter.
+
+        Raises:
+            ValueError: If the matched tensor is incompatible with the expansion or SE layers.
         """
         if ".backbone.conv_exp.reparam_conv.weight" in name:
             yield from self._emit("v.fastvit.conv_exp.weight", data)
@@ -323,16 +364,17 @@ class JingyuVisionModel(MmprojModel):
     def _map_network(self, name: str, data: torch.Tensor) -> Iterable[Tuple[str, torch.Tensor]]:
         """Map backbone ``network.*`` tensors into the GGUF vision layout.
 
-        Handles downsample, positional conv, mixer, attention, and ConvFFN paths. ConvFFN depthwise conv+BN pieces are buffered and fused when a
-        complete set is available.
+        Buffers the ConvFFN depthwise convolution and batch normalization parameters until the full set is available for fusion.
 
         Args:
             name (str): Checkpoint tensor name under ``backbone.network``.
             data (torch.Tensor): Source tensor.
 
         Yields:
-            Tuple[str, torch.Tensor]: Zero or more mapped tensors. For ConvFFN BN pieces, yields nothing until fusion completes, then yields the fused
-            depthwise ``weight`` and ``bias``.
+            Tuple[str, torch.Tensor]: Mapped tensors, including the fused depthwise weight and bias for a complete ConvFFN block.
+
+        Raises:
+            ValueError: If a mapped tensor or a parameter needed for batch normalization fusion has the wrong shape.
         """
         # Downsample: network.{i}.proj.{0,1}.*
         m = re.match(r".*network\.(\d+)\.proj\.0\.lkb_reparam\.(weight|bias)$", name)
@@ -390,8 +432,7 @@ class JingyuVisionModel(MmprojModel):
             yield from self._emit(f"v.fastvit.net.{m.group(1)}.blk.{m.group(2)}.ffn.fc{m.group(3)}.{m.group(4)}", data)
             return
 
-        # HF FastViT checkpoints always ship the ConvFFN depthwise conv together with a
-        # BN; the fused dw weight/bias is emitted once the whole BN set has arrived.
+        # The converter can encounter batch normalization parameters before or after the convolution weights.
         m = re.match(r".*network\.(\d+)\.(\d+)\.convffn\.conv\.(conv\.weight|bn\.(weight|bias|running_mean|running_var|num_batches_tracked))$", name)
         if m:
             ni, bi = m.group(1), m.group(2)
@@ -412,9 +453,15 @@ class JingyuVisionModel(MmprojModel):
                 buf["var"] = data
             needed = {"w", "bn_w", "bn_b", "mean", "var"}
             if needed.issubset(buf):
+                prefix = f"v.fastvit.net.{ni}.blk.{bi}.ffn.dw"
+                for part in needed:
+                    param = "weight" if part == "w" else "bias"
+                    shape = self._expected_shapes.get(f"{prefix}.{param}")
+                    if tuple(buf[part].shape) != shape:
+                        raise ValueError(f"jingyu: unexpected shape {tuple(buf[part].shape)} for {prefix} {part}; expected {shape}")
                 fw, fb = _fuse_conv_bn(buf["w"], buf["bn_w"], buf["bn_b"], buf["mean"], buf["var"])
-                yield from self._emit(f"v.fastvit.net.{ni}.blk.{bi}.ffn.dw.weight", fw)
-                yield from self._emit(f"v.fastvit.net.{ni}.blk.{bi}.ffn.dw.bias", fb)
+                yield from self._emit(f"{prefix}.weight", fw)
+                yield from self._emit(f"{prefix}.bias", fb)
                 del self._ffn_bn_buf[key]
             return
 
@@ -427,8 +474,10 @@ class JingyuVisionModel(MmprojModel):
             bid (int | None): Block index from the base converter. Unused for Jingyu vision export.
 
         Yields:
-            Tuple[str, torch.Tensor]: Mapped ``(gguf_name, tensor)`` pairs for projector / vision tensors that are kept. Yields nothing for language
-            tensors, unused classifier heads, or unmatched names (unmatched vision names are logged as warnings).
+            Tuple[str, torch.Tensor]: Mapped pairs for retained vision and projector tensors.
+
+        Raises:
+            ValueError: If a mapped tensor is incompatible with the runtime graph.
         """
         del bid
         if "mm_projector" in name:

@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -193,6 +194,10 @@ MAKE_TEST(test_image_preprocessor_jingyu) {
         { {81, 81}, 0x09575288 },
         { {7, 11},  0xa48ae9ac },
         { {64, 64}, 0xb69fe616 },
+        { {64, 7},  0x01c58a94 },
+        { {7, 64},  0x7ff97d18 },
+        { {1025, 7}, 0xaa8af486 },
+        { {7, 1025}, 0x26f45a11 },
     };
     for (const auto & [size, expected] : cases) {
         const auto output = preproc.preprocess(make_test_image(size));
@@ -1102,12 +1107,41 @@ MAKE_TEST(test_kokoro_istft) {
 // main
 //
 
+static int test_jingyu_mmproj(const char * path) {
+    try {
+        const auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        const auto models = mtmd_model_load(path, {}, ggml_backend_dev_buffer_type(cpu));
+        if (!models.v || models.v->proj_type != PROJECTOR_TYPE_JINGYU) {
+            throw std::runtime_error("expected a Jingyu vision model");
+        }
+        mtmd_backends backends(nullptr, 2, models.v->max_nodes, nullptr, nullptr);
+        mtmd_subcontext ctx(*models.v, backends, {MTMD_FLASH_ATTN_TYPE_DISABLED, false});
+        const auto images = mtmd_image_preprocessor_jingyu(models.v.get()).preprocess(make_test_image({81, 30}));
+        const auto & image = images.entries.at(0);
+        const int tokens = models.v->n_output_tokens(&image);
+        const int width = models.v->n_mmproj_embd();
+        std::vector<float> output(tokens * width);
+        if (tokens != 256 || width != 32 || !ctx.encode_image(2, &image, output)
+                || !std::all_of(output.begin(), output.end(), [](float v) { return std::isfinite(v); })) {
+            throw std::runtime_error("Jingyu fixture did not produce finite 256 x 32 embeddings");
+        }
+        return 0;
+    } catch (const std::exception & e) {
+        std::cerr << e.what() << '\n';
+        return 1;
+    }
+}
+
 int main(int argc, char ** argv) {
     testing t(std::cout);
     t.verbose = true;
 
     // the audio preprocessors run on the CPU backend
     ggml_backend_load_all();
+
+    if (argc == 3 && std::strcmp(argv[1], "--jingyu-mmproj") == 0) {
+        return test_jingyu_mmproj(argv[2]);
+    }
 
     // the video helper logs every frame at debug level
     mtmd_helper_log_set([](ggml_log_level level, const char * text, void *) {

@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "mtmd-impl.h"
+#include "models/fastvithd.h"
 
 #include <algorithm>
 #include <array>
@@ -514,33 +515,6 @@ struct qf_block {
     ggml_tensor * qf_proj_post_norm_b = nullptr;
     ggml_tensor * qf_proj_img_pos     = nullptr; // Vision only
     std::vector<mtmd_layer> qf_proj_layers;
-};
-
-struct fastvit_conv2d {
-    ggml_tensor * w = nullptr;
-    ggml_tensor * b = nullptr;
-};
-
-struct fastvit_repmixer_block {
-    fastvit_conv2d mixer;
-    ggml_tensor *  ls = nullptr;
-    fastvit_conv2d ffn_dw;
-    fastvit_conv2d ffn_fc1;
-    fastvit_conv2d ffn_fc2;
-};
-
-struct fastvit_attn_block {
-    ggml_tensor *  norm_w = nullptr;
-    ggml_tensor *  norm_b = nullptr;
-    ggml_tensor *  qkv_w  = nullptr;
-    ggml_tensor *  qkv_b  = nullptr;
-    ggml_tensor *  proj_w = nullptr;
-    ggml_tensor *  proj_b = nullptr;
-    ggml_tensor *  ls1    = nullptr;
-    ggml_tensor *  ls2    = nullptr;
-    fastvit_conv2d ffn_dw;
-    fastvit_conv2d ffn_fc1;
-    fastvit_conv2d ffn_fc2;
 };
 
 // pocket-tts SEANet stack, used in both directions:
@@ -1351,18 +1325,7 @@ struct mtmd_model {
     ggml_tensor * mobilenet_stem_norm_w = nullptr;
     ggml_tensor * mm_post_proj_norm_w = nullptr;
 
-    // Jingyu
-    fastvit_conv2d                      fv_stem[3];
-    std::vector<fastvit_repmixer_block> fv_stage0;
-    std::vector<fastvit_repmixer_block> fv_stage1;
-    std::vector<fastvit_repmixer_block> fv_stage2;
-    std::vector<fastvit_attn_block>     fv_stage3;
-    std::vector<fastvit_attn_block>     fv_stage4;
-    fastvit_conv2d                      fv_down[4][2];
-    fastvit_conv2d                      fv_pos[2];
-    fastvit_conv2d                      fv_conv_exp;
-    fastvit_conv2d                      fv_se_reduce;
-    fastvit_conv2d                      fv_se_expand;
+    fastvit_weights fastvit;
 
     // Multi-Scale Fusion Adapter (MSFA) components
     ggml_tensor * msfa_concat_conv_w = nullptr;

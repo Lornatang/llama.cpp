@@ -1,4 +1,12 @@
-"""Regression tests for Jingyu mmproj conversion using synthetic weights."""
+# Copyright Larry. All Rights Reserved.
+# SPDX-License-Identifier: MIT
+# ==============================================================================
+"""Exercise Jingyu mmproj conversion without downloading model weights.
+
+The synthetic checkpoint uses the production block layout with smaller
+channels. Set ``JINGYU_MMPROJ_TEST`` to the path to ``test-mtmd-impl`` to also
+load the F16 export and encode an image on the CPU.
+"""
 
 import json
 import os
@@ -9,18 +17,22 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-from safetensors.numpy import save_file
 import torch
 import torch.nn.functional as F
+from safetensors.numpy import save_file
 
+from conversion.base import gguf
 from conversion.jingyu import JingyuVisionModel, _fuse_conv_bn
-import gguf
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def fixture_tensors():
+    """Create a small FastViT-HD checkpoint with the production block layout.
+
+    Returns:
+        dict[str, np.ndarray]: Synthetic weights keyed by Hugging Face tensor name.
+    """
     tensors = {}
     prefix = "vision_tower.vision_model.backbone."
 
@@ -50,8 +62,8 @@ def fixture_tensors():
             put(f"network.{net}.{block}.layer_scale", (channels, 1, 1), 1)
             ffn(net, block, channels)
     for net, in_ch, out_ch in ((1, 4, 8), (3, 8, 16), (5, 16, 32), (8, 32, 32)):
-        conv(f"network.{net}.proj.0.lkb_reparam", in_ch, in_ch, 7, True)
-        conv(f"network.{net}.proj.1.reparam_conv", in_ch, out_ch, 1)
+        conv(f"network.{net}.proj.0.lkb_reparam", in_ch, out_ch, 7, True)
+        conv(f"network.{net}.proj.1.reparam_conv", out_ch, out_ch, 1)
     for net in (6, 9):
         conv(f"network.{net}.reparam_conv", 32, 32, 7, True)
     for net, count in ((7, 4), (10, 2)):
@@ -66,8 +78,8 @@ def fixture_tensors():
             put(name + ".token_mixer.proj.bias", (32,))
             ffn(net, block, 32)
     conv("conv_exp.reparam_conv", 32, 64, 3, True)
-    conv("conv_exp.se.reduce", 64, 16, 1)
-    conv("conv_exp.se.expand", 16, 64, 1)
+    conv("conv_exp.se.reduce", 64, 4, 1)
+    conv("conv_exp.se.expand", 4, 64, 1)
     for index, in_ch in ((0, 64), (2, 32)):
         tensors[f"mm_projector.{index}.weight"] = np.full((32, in_ch), 0.001, dtype=np.float32)
         tensors[f"mm_projector.{index}.bias"] = np.zeros((32,), dtype=np.float32)
@@ -75,37 +87,67 @@ def fixture_tensors():
 
 
 class TestJingyuConversion(unittest.TestCase):
+    """Check conversion and optionally run the exported projector on the CPU."""
+
     @classmethod
     def setUpClass(cls):
         cls.tensors = fixture_tensors()
 
-    def make_checkpoint(self, directory, *, size=1024, tensors=None):
+    def make_checkpoint(self, directory, *, size=1024, tensors=None, overrides=None):
+        """Write a synthetic Hugging Face checkpoint for one conversion test.
+
+        Args:
+            directory (Path): Directory for the checkpoint and processor configuration.
+            size (int): Square image size declared by the vision config.
+            tensors (dict[str, np.ndarray] | None): Replacement weights for a test case.
+            overrides (dict | None): Overrides for top-level model configuration keys.
+        """
         config = {
             "architectures": ["JingyuForConditionalGeneration"],
-            "model_type": "jingyu", "hidden_size": 32, "mm_hidden_size": 64, "num_hidden_layers": 1,
-            "vision_config": {"layers": [2, 12, 24, 4, 2], "embed_dims": [96, 192, 384, 768, 1536],
-                              "image_size": size, "patch_size": 64},
+            "model_type": "jingyu",
+            "hidden_size": 32,
+            "mm_hidden_size": 64,
+            "num_hidden_layers": 1,
+            "vision_config": {"layers": [2, 12, 24, 4, 2], "embed_dims": [4, 8, 16, 32, 32], "image_size": size, "patch_size": 64},
         }
+        config.update(overrides or {})
         (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        # Integer input exercises the converter's float32 GGUF metadata normalization.
         (directory / "preprocessor_config.json").write_text(json.dumps({"image_mean": [0, 0, 0], "image_std": [1, 1, 1]}), encoding="utf-8")
         save_file(self.tensors if tensors is None else tensors, str(directory / "model.safetensors"))
 
     def convert(self, directory, outtype="f16"):
+        """Run the mmproj converter on a test checkpoint.
+
+        Args:
+            directory (Path): Directory containing the synthetic checkpoint.
+            outtype (str): GGUF output precision passed to the converter.
+
+        Returns:
+            tuple[subprocess.CompletedProcess, Path]: Process result with combined output and the requested GGUF path.
+        """
         output = directory / f"model-{outtype}.gguf"
         env = {**os.environ, "OMP_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "1"}
-        result = subprocess.run([sys.executable, str(ROOT / "convert_hf_to_gguf.py"), str(directory), "--mmproj",
-                                 "--outtype", outtype, "--outfile", str(output)],
-                                cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "convert_hf_to_gguf.py"), str(directory), "--mmproj", "--outtype", outtype, "--outfile", str(output)],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
         return result, output
 
-    def test_formats_and_supported_resolution(self):
+    def test_formats_and_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
-            self.make_checkpoint(directory, size=512)
-            for outtype, matrix_type in (("f16", gguf.GGMLQuantizationType.F16),
-                                         ("bf16", gguf.GGMLQuantizationType.BF16),
-                                         ("q8_0", gguf.GGMLQuantizationType.Q8_0),
-                                         ("f32", gguf.GGMLQuantizationType.F32)):
+            self.make_checkpoint(directory)
+            for outtype, matrix_type in (
+                ("f16", gguf.GGMLQuantizationType.F16),
+                ("bf16", gguf.GGMLQuantizationType.BF16),
+                ("q8_0", gguf.GGMLQuantizationType.Q8_0),
+                ("f32", gguf.GGMLQuantizationType.F32),
+            ):
                 with self.subTest(outtype=outtype):
                     result, output = self.convert(directory, outtype)
                     self.assertEqual(result.returncode, 0, result.stdout[-4000:])
@@ -113,10 +155,16 @@ class TestJingyuConversion(unittest.TestCase):
                     tensors = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
                     self.assertEqual(tensors["mm.0.weight"], matrix_type)
                     self.assertEqual(tensors["v.fastvit.net.7.blk.0.qkv.weight"], matrix_type)
-                    self.assertEqual(tensors["v.fastvit.stem.0.weight"],
-                                     gguf.GGMLQuantizationType.F32 if outtype == "f32" else gguf.GGMLQuantizationType.F16)
+                    self.assertEqual(
+                        tensors["v.fastvit.stem.0.weight"], gguf.GGMLQuantizationType.F32 if outtype == "f32" else gguf.GGMLQuantizationType.F16
+                    )
                     self.assertEqual(tensors["v.fastvit.net.0.blk.0.ls.weight"], gguf.GGMLQuantizationType.F32)
+                    for key in ("image_mean", "image_std"):
+                        self.assertEqual(reader.fields[f"clip.vision.{key}"].types, [gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.FLOAT32])
                     del reader
+                    if outtype == "f16" and (runtime := os.environ.get("JINGYU_MMPROJ_TEST")):
+                        result = subprocess.run([runtime, "--jingyu-mmproj", str(output)], capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 0, result.stderr[-4000:])
 
     def test_incomplete_bn_and_missing_backbone_fail(self):
         missing_bn = dict(self.tensors)
@@ -124,9 +172,11 @@ class TestJingyuConversion(unittest.TestCase):
         missing_bias = dict(self.tensors)
         del missing_bias["mm_projector.0.bias"]
         only_projector = {k: v for k, v in self.tensors.items() if k.startswith("mm_projector.")}
-        for tensors, error in ((missing_bn, "incomplete ConvFFN batch normalization"),
-                               (missing_bias, "required vision/projector tensors"),
-                               (only_projector, "required vision/projector tensors")):
+        for tensors, error in (
+            (missing_bn, "incomplete ConvFFN batch normalization"),
+            (missing_bias, "required vision/projector tensors"),
+            (only_projector, "required vision/projector tensors"),
+        ):
             with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
                 self.make_checkpoint(directory, tensors=tensors)
@@ -138,11 +188,26 @@ class TestJingyuConversion(unittest.TestCase):
     def test_invalid_resolution_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
-            self.make_checkpoint(directory, size=513)
+            self.make_checkpoint(directory, size=512)
             result, output = self.convert(directory)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("image_size must be a positive multiple of 64", result.stdout)
+            self.assertIn("unsupported image_size=512", result.stdout)
             self.assertFalse(output.exists())
+
+    def test_incompatible_projector(self):
+        bad_shape = {**self.tensors, "mm_projector.2.weight": np.zeros((32, 33), dtype=np.float32)}
+        for overrides, tensors, error in (
+            ({"mm_projector_type": "mlp3x_gelu"}, None, "unsupported mm_projector_type"),
+            ({"mm_patch_merge_type": "spatial_unpad"}, None, "unsupported mm_patch_merge_type"),
+            ({}, bad_shape, "unexpected tensor mm.2.weight"),
+        ):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                self.make_checkpoint(directory, tensors=tensors, overrides=overrides)
+                result, output = self.convert(directory)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(error, result.stdout)
+                self.assertFalse(output.exists())
 
     def test_bn_fusion_and_counter_order(self):
         torch.manual_seed(4)
@@ -158,9 +223,19 @@ class TestJingyuConversion(unittest.TestCase):
         model = object.__new__(JingyuVisionModel)
         model._ffn_bn_buf = {}
         model._emitted_tensors = set()
+        model._expected_shapes = {
+            "v.fastvit.net.0.blk.0.ffn.dw.weight": (4, 1, 3, 3),
+            "v.fastvit.net.0.blk.0.ffn.dw.bias": (4,),
+        }
         prefix = "vision_tower.vision_model.backbone.network.0.0.convffn.conv."
-        parts = (("conv.weight", weight), ("bn.weight", gamma), ("bn.bias", beta),
-                 ("bn.running_mean", mean), ("bn.running_var", var), ("bn.num_batches_tracked", torch.tensor(1)))
+        parts = (
+            ("conv.weight", weight),
+            ("bn.weight", gamma),
+            ("bn.bias", beta),
+            ("bn.running_mean", mean),
+            ("bn.running_var", var),
+            ("bn.num_batches_tracked", torch.tensor(1)),
+        )
         for name, data in parts:
             list(model._map_network(prefix + name, data))
         self.assertFalse(model._ffn_bn_buf)

@@ -314,12 +314,9 @@ struct mtmd_model_loader {
                     } break;
                 case PROJECTOR_TYPE_JINGYU:
                     {
-                        hparams.has_llava_projector = false;
-                        hparams.image_pad_color     = {0, 0, 0};
                         if (hparams.patch_size != 64 || hparams.image_size <= 0 || hparams.image_size % 64 != 0) {
                             throw std::runtime_error(mtmd_format("%s: Jingyu requires patch_size 64 and a positive image_size divisible by 64\n", __func__));
                         }
-                        hparams.warmup_image_size = hparams.image_size;
                     } break;
                 case PROJECTOR_TYPE_GLM_EDGE:
                     {
@@ -1880,82 +1877,7 @@ struct mtmd_model_loader {
                     model.image_newline = get_tensor(TN_IMAGE_NEWLINE, false);
                 } break;
             case PROJECTOR_TYPE_JINGYU:
-                {
-                    auto load_conv = [&](fastvit_conv2d & c, const std::string & wname, const std::string & bname) {
-                        c.w = get_tensor(wname);
-                        c.b = get_tensor(bname, false);
-                    };
-                    auto load_repmixer = [&](int ni, int n_blk, std::vector<fastvit_repmixer_block> & out) {
-                        out.resize(n_blk);
-                        for (int bi = 0; bi < n_blk; ++bi) {
-                            auto & blk = out[bi];
-                            load_conv(blk.mixer, mtmd_format(TN_FV_NET_MIXER, ni, bi, "weight"),
-                                      mtmd_format(TN_FV_NET_MIXER, ni, bi, "bias"));
-                            blk.ls = get_tensor(mtmd_format(TN_FV_NET_LS, ni, bi));
-                            load_conv(blk.ffn_dw, mtmd_format(TN_FV_NET_FFN_DW, ni, bi, "weight"),
-                                      mtmd_format(TN_FV_NET_FFN_DW, ni, bi, "bias"));
-                            load_conv(blk.ffn_fc1, mtmd_format(TN_FV_NET_FFN_FC1, ni, bi, "weight"),
-                                      mtmd_format(TN_FV_NET_FFN_FC1, ni, bi, "bias"));
-                            load_conv(blk.ffn_fc2, mtmd_format(TN_FV_NET_FFN_FC2, ni, bi, "weight"),
-                                      mtmd_format(TN_FV_NET_FFN_FC2, ni, bi, "bias"));
-                        }
-                    };
-                    auto load_attn = [&](int ni, int n_blk, std::vector<fastvit_attn_block> & out) {
-                        out.resize(n_blk);
-                        for (int bi = 0; bi < n_blk; ++bi) {
-                            auto & blk = out[bi];
-                            blk.norm_w = get_tensor(mtmd_format(TN_FV_NET_NORM, ni, bi, "weight"));
-                            blk.norm_b = get_tensor(mtmd_format(TN_FV_NET_NORM, ni, bi, "bias"));
-                            blk.qkv_w  = get_tensor(mtmd_format(TN_FV_NET_QKV, ni, bi, "weight"));
-                            blk.qkv_b  = get_tensor(mtmd_format(TN_FV_NET_QKV, ni, bi, "bias"), false);
-                            blk.proj_w = get_tensor(mtmd_format(TN_FV_NET_PROJ, ni, bi, "weight"));
-                            blk.proj_b = get_tensor(mtmd_format(TN_FV_NET_PROJ, ni, bi, "bias"), false);
-                            blk.ls1    = get_tensor(mtmd_format(TN_FV_NET_LS1, ni, bi));
-                            blk.ls2    = get_tensor(mtmd_format(TN_FV_NET_LS2, ni, bi));
-                            load_conv(blk.ffn_dw, mtmd_format(TN_FV_NET_FFN_DW, ni, bi, "weight"),
-                                      mtmd_format(TN_FV_NET_FFN_DW, ni, bi, "bias"));
-                            load_conv(blk.ffn_fc1, mtmd_format(TN_FV_NET_FFN_FC1, ni, bi, "weight"),
-                                      mtmd_format(TN_FV_NET_FFN_FC1, ni, bi, "bias"));
-                            load_conv(blk.ffn_fc2, mtmd_format(TN_FV_NET_FFN_FC2, ni, bi, "weight"),
-                                      mtmd_format(TN_FV_NET_FFN_FC2, ni, bi, "bias"));
-                        }
-                    };
-
-                    for (int i = 0; i < 3; ++i) {
-                        load_conv(model.fv_stem[i], mtmd_format(TN_FV_STEM, i, "weight"),
-                                  mtmd_format(TN_FV_STEM, i, "bias"));
-                    }
-                    load_repmixer(0, 2, model.fv_stage0);
-                    load_repmixer(2, 12, model.fv_stage1);
-                    load_repmixer(4, 24, model.fv_stage2);
-                    load_attn(7, 4, model.fv_stage3);
-                    load_attn(10, 2, model.fv_stage4);
-
-                    const int down_net[4] = { 1, 3, 5, 8 };
-                    for (int di = 0; di < 4; ++di) {
-                        for (int pi = 0; pi < 2; ++pi) {
-                            load_conv(model.fv_down[di][pi], mtmd_format(TN_FV_NET_DOWN, down_net[di], pi, "weight"),
-                                      mtmd_format(TN_FV_NET_DOWN, down_net[di], pi, "bias"));
-                        }
-                    }
-                    load_conv(model.fv_pos[0], mtmd_format(TN_FV_NET_POS, 6, "weight"),
-                              mtmd_format(TN_FV_NET_POS, 6, "bias"));
-                    load_conv(model.fv_pos[1], mtmd_format(TN_FV_NET_POS, 9, "weight"),
-                              mtmd_format(TN_FV_NET_POS, 9, "bias"));
-
-                    load_conv(model.fv_conv_exp, mtmd_format(TN_FV_CONV_EXP, "weight"),
-                              mtmd_format(TN_FV_CONV_EXP, "bias"));
-                    load_conv(model.fv_se_reduce, mtmd_format(TN_FV_CONV_EXP_SE_R, "weight"),
-                              mtmd_format(TN_FV_CONV_EXP_SE_R, "bias"));
-                    load_conv(model.fv_se_expand, mtmd_format(TN_FV_CONV_EXP_SE_E, "weight"),
-                              mtmd_format(TN_FV_CONV_EXP_SE_E, "bias"));
-
-                    // mlp2x_gelu projector
-                    model.mm_0_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 0, "weight"));
-                    model.mm_0_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 0, "bias"), false);
-                    model.mm_2_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "weight"));
-                    model.mm_2_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "bias"), false);
-                }
+                load_fastvithd(model, get_tensor);
                 break;
             case PROJECTOR_TYPE_LDP:
                 {
