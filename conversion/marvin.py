@@ -18,10 +18,38 @@ from typing import Any, Callable, Dict, Iterable, Tuple
 import torch
 
 from .base import MmprojModel, ModelBase, gguf, logger
-from .qwen import Qwen3Model
+from .qwen import Qwen3_5TextModel, Qwen3Model
+
+
+@ModelBase.register("MarvinMuseForConditionalGeneration", "MarvinSparkForConditionalGeneration")
+class MarvinQwen3TextModel(Qwen3Model):
+    """Export the Qwen3 language tower shared by Marvin Muse and Spark."""
+
+    model_arch = gguf.MODEL_ARCH.QWEN3
+
+
+@ModelBase.register("MarvinVerseForConditionalGeneration")
+class MarvinVerseTextModel(Qwen3_5TextModel):
+    """Export the Qwen3.5 language tower from Marvin Verse."""
+
+    model_arch = gguf.MODEL_ARCH.QWEN35
+    supports_mtp_export = False
+    no_mtp = True
+
 
 _STAGES = ((0, 2), (2, 12), (4, 24), (7, 4), (10, 2))
 _WIDTHS = (96, 192, 384, 768, 1536)
+_STAGE_CONVS = {"proj.0.lkb_reparam": "down.0", "proj.1.reparam_conv": "down.1", "reparam_conv": "pos"}
+_BLOCK_LAYERS = {
+    "token_mixer.reparam_conv": "mixer",
+    "norm": "norm",
+    "token_mixer.qkv": "qkv",
+    "token_mixer.proj": "proj",
+    "convffn.fc1": "ffn.fc1",
+    "convffn.fc2": "ffn.fc2",
+}
+_LAYER_SCALES = {"layer_scale": "ls", "layer_scale_1": "ls1", "layer_scale_2": "ls2"}
+_FFN_BN_PARTS = ("conv.weight", "bn.weight", "bn.bias", "bn.running_mean", "bn.running_var")
 
 
 def _fuse_conv_bn(
@@ -53,34 +81,6 @@ def _fuse_conv_bn(
     fused_w = weight * scale
     fused_b = bn_bias - running_mean * bn_weight / std
     return fused_w, fused_b
-
-
-@ModelBase.register("MarvinMuseForConditionalGeneration")
-class MarvinMuseTextModel(Qwen3Model):
-    """Export only the Qwen3 language tower from a Marvin Muse checkpoint.
-
-    Attributes:
-        model_arch (gguf.MODEL_ARCH): GGUF architecture tag, always Qwen3.
-    """
-
-    model_arch = gguf.MODEL_ARCH.QWEN3
-
-    @classmethod
-    def filter_tensors(cls, item: Tuple[str, Callable[[], torch.Tensor]]) -> Tuple[str, Callable[[], torch.Tensor]] | None:
-        """Select the tensors handled by the Qwen3 text converter.
-
-        Args:
-            item (Tuple[str, Callable[[], torch.Tensor]]): Checkpoint pair ``(tensor_name, lazy_loader)``.
-
-        Returns:
-            Tuple[str, Callable[[], torch.Tensor]] | None: The pair with any ``language_model.`` prefix removed, or ``None`` for discarded tensors.
-        """
-        name, gen = item
-        if "vision_tower" in name or "mm_projector" in name:
-            return None
-        if name.startswith("language_model."):
-            name = name[len("language_model.") :]
-        return super().filter_tensors((name, gen))
 
 
 @ModelBase.register("MarvinMuseForConditionalGeneration")
@@ -164,8 +164,10 @@ class MarvinMuseVisionModel(MmprojModel):
         """
         super().prepare_tensors()
         if self._ffn_bn_buf:
-            needed = {"w", "bn_w", "bn_b", "mean", "var"}
-            incomplete = [f"{key}: {', '.join(sorted(needed - set(parts)))}" for key, parts in sorted(self._ffn_bn_buf.items())]
+            incomplete = [
+                f"{key}: {', '.join(part for part in _FFN_BN_PARTS if part not in parts)}"
+                for key, parts in sorted(self._ffn_bn_buf.items())
+            ]
             raise ValueError(f"marvin_muse: incomplete ConvFFN batch normalization tensors: {'; '.join(incomplete)}")
         missing = sorted(self._expected_shapes.keys() - self._emitted_tensors)
         if missing:
@@ -237,7 +239,7 @@ class MarvinMuseVisionModel(MmprojModel):
     def set_gguf_parameters(self) -> None:
         """Write the generic vision metadata and Marvin Muse's projector settings."""
         super().set_gguf_parameters()
-        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.MARVIN_MUSE)
+        self.gguf_writer.add_clip_projector_type("marvin_muse")
         self.gguf_writer.add_vision_use_gelu(True)
         self.gguf_writer.add_vision_attention_layernorm_eps(1e-5)
 
@@ -348,18 +350,10 @@ class MarvinMuseVisionModel(MmprojModel):
         Raises:
             ValueError: If the matched tensor is incompatible with the expansion or SE layers.
         """
-        if ".backbone.conv_exp.reparam_conv.weight" in name:
-            yield from self._emit("v.fastvit.conv_exp.weight", data)
-        elif ".backbone.conv_exp.reparam_conv.bias" in name:
-            yield from self._emit("v.fastvit.conv_exp.bias", data)
-        elif ".backbone.conv_exp.se.reduce.weight" in name:
-            yield from self._emit("v.fastvit.conv_exp.se.reduce.weight", data)
-        elif ".backbone.conv_exp.se.reduce.bias" in name:
-            yield from self._emit("v.fastvit.conv_exp.se.reduce.bias", data)
-        elif ".backbone.conv_exp.se.expand.weight" in name:
-            yield from self._emit("v.fastvit.conv_exp.se.expand.weight", data)
-        elif ".backbone.conv_exp.se.expand.bias" in name:
-            yield from self._emit("v.fastvit.conv_exp.se.expand.bias", data)
+        suffix = name.partition(".backbone.conv_exp.")[2]
+        layer, _, param = suffix.rpartition(".")
+        if param in ("weight", "bias") and layer in ("reparam_conv", "se.reduce", "se.expand"):
+            yield from self._emit(f"v.fastvit.conv_exp.{suffix.removeprefix('reparam_conv.')}", data)
 
     def _map_network(self, name: str, data: torch.Tensor) -> Iterable[Tuple[str, torch.Tensor]]:
         """Map backbone ``network.*`` tensors into the GGUF vision layout.
@@ -376,94 +370,48 @@ class MarvinMuseVisionModel(MmprojModel):
         Raises:
             ValueError: If a mapped tensor or a parameter needed for batch normalization fusion has the wrong shape.
         """
-        # Downsample: network.{i}.proj.{0,1}.*
-        m = re.match(r".*network\.(\d+)\.proj\.0\.lkb_reparam\.(weight|bias)$", name)
-        if m:
-            yield from self._emit(f"v.fastvit.net.{m.group(1)}.down.0.{m.group(2)}", data)
-            return
-        m = re.match(r".*network\.(\d+)\.proj\.1\.reparam_conv\.(weight|bias)$", name)
-        if m:
-            yield from self._emit(f"v.fastvit.net.{m.group(1)}.down.1.{m.group(2)}", data)
+        stage, _, suffix = name.partition(".backbone.network.")[2].partition(".")
+        if not stage.isdecimal():
             return
 
-        # Conditional positional encoding: network.{i}.reparam_conv.*
-        m = re.match(r".*network\.(\d+)\.reparam_conv\.(weight|bias)$", name)
-        if m:
-            yield from self._emit(f"v.fastvit.net.{m.group(1)}.pos.{m.group(2)}", data)
+        prefix = f"v.fastvit.net.{stage}"
+        block, _, block_suffix = suffix.partition(".")
+        if not block.isdecimal():
+            layer, _, param = suffix.rpartition(".")
+            if param in ("weight", "bias") and (target := _STAGE_CONVS.get(layer)):
+                yield from self._emit(f"{prefix}.{target}.{param}", data)
             return
 
-        # Token mixer
-        m = re.match(r".*network\.(\d+)\.(\d+)\.token_mixer\.reparam_conv\.(weight|bias)$", name)
-        if m:
-            yield from self._emit(f"v.fastvit.net.{m.group(1)}.blk.{m.group(2)}.mixer.{m.group(3)}", data)
+        prefix = f"{prefix}.blk.{block}"
+        if target := _LAYER_SCALES.get(block_suffix):
+            yield from self._emit(f"{prefix}.{target}.weight", data)
             return
 
-        # Mixer layer scale
-        m = re.match(r".*network\.(\d+)\.(\d+)\.layer_scale$", name)
-        if m:
-            yield from self._emit(f"v.fastvit.net.{m.group(1)}.blk.{m.group(2)}.ls.weight", data)
+        layer, _, param = block_suffix.rpartition(".")
+        if param in ("weight", "bias") and (target := _BLOCK_LAYERS.get(layer)):
+            yield from self._emit(f"{prefix}.{target}.{param}", data)
             return
 
-        # Attention block: norms / scales / qkv / proj
-        m = re.match(r".*network\.(\d+)\.(\d+)\.norm\.(weight|bias)$", name)
-        if m:
-            yield from self._emit(f"v.fastvit.net.{m.group(1)}.blk.{m.group(2)}.norm.{m.group(3)}", data)
-            return
-        m = re.match(r".*network\.(\d+)\.(\d+)\.layer_scale_1$", name)
-        if m:
-            yield from self._emit(f"v.fastvit.net.{m.group(1)}.blk.{m.group(2)}.ls1.weight", data)
-            return
-        m = re.match(r".*network\.(\d+)\.(\d+)\.layer_scale_2$", name)
-        if m:
-            yield from self._emit(f"v.fastvit.net.{m.group(1)}.blk.{m.group(2)}.ls2.weight", data)
-            return
-        m = re.match(r".*network\.(\d+)\.(\d+)\.token_mixer\.qkv\.(weight|bias)$", name)
-        if m:
-            yield from self._emit(f"v.fastvit.net.{m.group(1)}.blk.{m.group(2)}.qkv.{m.group(3)}", data)
-            return
-        m = re.match(r".*network\.(\d+)\.(\d+)\.token_mixer\.proj\.(weight|bias)$", name)
-        if m:
-            yield from self._emit(f"v.fastvit.net.{m.group(1)}.blk.{m.group(2)}.proj.{m.group(3)}", data)
+        part = block_suffix.removeprefix("convffn.conv.")
+        if part == block_suffix or part not in _FFN_BN_PARTS:
             return
 
-        # ConvFFN: pass through fc1/fc2; fuse depthwise conv + BN
-        m = re.match(r".*network\.(\d+)\.(\d+)\.convffn\.fc([12])\.(weight|bias)$", name)
-        if m:
-            yield from self._emit(f"v.fastvit.net.{m.group(1)}.blk.{m.group(2)}.ffn.fc{m.group(3)}.{m.group(4)}", data)
+        key = f"{stage}.{block}"
+        buf = self._ffn_bn_buf.setdefault(key, {})
+        buf[part] = data
+        if any(part not in buf for part in _FFN_BN_PARTS):
             return
 
-        # The converter can encounter batch normalization parameters before or after the convolution weights.
-        m = re.match(r".*network\.(\d+)\.(\d+)\.convffn\.conv\.(conv\.weight|bn\.(weight|bias|running_mean|running_var|num_batches_tracked))$", name)
-        if m:
-            ni, bi = m.group(1), m.group(2)
-            part = m.group(3)
-            if part == "bn.num_batches_tracked":
-                return
-            key = f"{ni}.{bi}"
-            buf = self._ffn_bn_buf.setdefault(key, {})
-            if part == "conv.weight":
-                buf["w"] = data
-            elif part == "bn.weight":
-                buf["bn_w"] = data
-            elif part == "bn.bias":
-                buf["bn_b"] = data
-            elif part == "bn.running_mean":
-                buf["mean"] = data
-            elif part == "bn.running_var":
-                buf["var"] = data
-            needed = {"w", "bn_w", "bn_b", "mean", "var"}
-            if needed.issubset(buf):
-                prefix = f"v.fastvit.net.{ni}.blk.{bi}.ffn.dw"
-                for part in needed:
-                    param = "weight" if part == "w" else "bias"
-                    shape = self._expected_shapes.get(f"{prefix}.{param}")
-                    if tuple(buf[part].shape) != shape:
-                        raise ValueError(f"marvin_muse: unexpected shape {tuple(buf[part].shape)} for {prefix} {part}; expected {shape}")
-                fw, fb = _fuse_conv_bn(buf["w"], buf["bn_w"], buf["bn_b"], buf["mean"], buf["var"])
-                yield from self._emit(f"{prefix}.weight", fw)
-                yield from self._emit(f"{prefix}.bias", fb)
-                del self._ffn_bn_buf[key]
-            return
+        prefix += ".ffn.dw"
+        for part in _FFN_BN_PARTS:
+            param = "weight" if part == "conv.weight" else "bias"
+            shape = self._expected_shapes.get(f"{prefix}.{param}")
+            if tuple(buf[part].shape) != shape:
+                raise ValueError(f"marvin_muse: unexpected shape {tuple(buf[part].shape)} for {prefix} {part}; expected {shape}")
+        fw, fb = _fuse_conv_bn(*(buf[part] for part in _FFN_BN_PARTS))
+        yield from self._emit(f"{prefix}.weight", fw)
+        yield from self._emit(f"{prefix}.bias", fb)
+        del self._ffn_bn_buf[key]
 
     def modify_tensors(self, data_torch: torch.Tensor, name: str, bid: int | None) -> Iterable[Tuple[str, torch.Tensor]]:
         """Route each checkpoint tensor to the appropriate GGUF mapper.

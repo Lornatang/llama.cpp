@@ -1,7 +1,7 @@
 # Copyright Larry. All Rights Reserved.
 # SPDX-License-Identifier: MIT
 # ==============================================================================
-"""Exercise Marvin Muse mmproj conversion without downloading model weights.
+"""Exercise Marvin GGUF conversion without downloading model weights.
 
 The synthetic checkpoint uses the production block layout with smaller
 channels. Set ``MARVIN_MUSE_MMPROJ_TEST`` to the path to ``test-mtmd-impl`` to also
@@ -21,10 +21,42 @@ import torch
 import torch.nn.functional as F
 from safetensors.numpy import save_file
 
+from conversion import get_model_class
 from conversion.base import gguf
-from conversion.marvin_muse import MarvinMuseVisionModel, _fuse_conv_bn
+from conversion.marvin import MarvinMuseVisionModel, _fuse_conv_bn
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class TestMarvinTextConversion(unittest.TestCase):
+    """Check architecture dispatch and keep vision weights out of text exports."""
+
+    def test_dispatch(self):
+        for variant, arch in (("Muse", gguf.MODEL_ARCH.QWEN3), ("Spark", gguf.MODEL_ARCH.QWEN3), ("Verse", gguf.MODEL_ARCH.QWEN35)):
+            with self.subTest(variant=variant):
+                model = get_model_class(f"Marvin{variant}ForConditionalGeneration")
+                self.assertEqual(model.model_arch, arch)
+
+        self.assertIs(get_model_class("MarvinMuseForConditionalGeneration", mmproj=True), MarvinMuseVisionModel)
+
+    def test_filters_multimodal_weights(self):
+        for variant in ("Muse", "Spark", "Verse"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                architecture = f"Marvin{variant}ForConditionalGeneration"
+                config = {"model_type": f"marvin_{variant.lower()}", "architectures": [architecture], "num_hidden_layers": 1}
+                (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+                save_file(
+                    {
+                        "language_model.model.embed_tokens.weight": np.ones((32, 32), dtype=np.float32),
+                        "model.vision_tower.vision_tower.encoder.patchifier.weight": np.zeros((32, 32), dtype=np.float32),
+                        "model.mm_projector.0.weight": np.zeros((32, 32), dtype=np.float32),
+                    },
+                    str(directory / "model.safetensors"),
+                )
+                model = get_model_class(architecture)(directory, gguf.LlamaFileType.MOSTLY_F16, directory / "model.gguf")
+                self.assertEqual(model.block_count, 1)
+                self.assertEqual(list(model.model_tensors), ["model.embed_tokens.weight"])
 
 
 def fixture_tensors():

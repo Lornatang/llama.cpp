@@ -14,11 +14,15 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
 struct ggml_tensor;
+struct mtmd_graph;
+struct mtmd_image_f32;
 struct mtmd_model;
+struct mtmd_subcontext;
 
 /// Kernel weights and optional bias for a convolution.
 struct fastvit_conv2d {
@@ -71,3 +75,5 @@ struct fastvit_weights {
 /// @param get_tensor  Looks up tensors by GGUF name. Pass false for the second argument to allow a missing tensor.
 /// @throws std::runtime_error If a required tensor is missing or the weights are incompatible.
 void load_fastvithd(mtmd_model & model, const std::function<ggml_tensor *(const std::string &, bool)> & get_tensor);
+
+std::unique_ptr<mtmd_graph> make_fastvithd_graph(mtmd_subcontext * ctx, const mtmd_image_f32 & img);

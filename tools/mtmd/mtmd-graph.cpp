@@ -768,7 +768,7 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
             } break;
         case PROJECTOR_TYPE_MARVIN_MUSE:
             {
-                builder = std::make_unique<mtmd_graph_fastvithd>(ctx, img);
+                builder = make_fastvithd_graph(ctx, img);
             } break;
         case PROJECTOR_TYPE_GEMMA4V:
             {

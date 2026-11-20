@@ -384,23 +384,6 @@ struct mtmd_graph_mobilenetv5 : mtmd_graph {
         const mobilenetv5_block & block);
 };
 
-struct mtmd_graph_fastvithd : mtmd_graph {
-    ggml_backend_t backend;
-    mtmd_graph_fastvithd(mtmd_subcontext * ctx, const mtmd_image_f32 & img) : mtmd_graph(ctx, img), backend(ctx->backends.backend) {}
-    ggml_cgraph * build() override;
-
-    ggml_tensor * conv2d(const fastvit_conv2d & c, ggml_tensor * x, int stride, int pad, bool depthwise);
-    ggml_tensor * gelu_act(ggml_tensor * x);
-    ggml_tensor * layer_scale(ggml_tensor * x, ggml_tensor * ls);
-    ggml_tensor * convffn(ggml_tensor * x, const fastvit_conv2d & dw, const fastvit_conv2d & fc1, const fastvit_conv2d & fc2);
-    ggml_tensor * repmixer_block(ggml_tensor * x, const fastvit_repmixer_block & blk);
-    ggml_tensor * channel_norm(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, float eps = 1e-5f);
-    ggml_tensor * mhsa(ggml_tensor * x, const fastvit_attn_block & blk);
-    ggml_tensor * attn_block(ggml_tensor * x, const fastvit_attn_block & blk);
-    ggml_tensor * downsample(ggml_tensor * x, const fastvit_conv2d & lkb, const fastvit_conv2d & pw);
-    ggml_tensor * se_block(ggml_tensor * x);
-};
-
 struct mtmd_graph_qwen3a : mtmd_graph {
     mtmd_graph_qwen3a(mtmd_subcontext * ctx, const mtmd_image_f32 & img) : mtmd_graph(ctx, img) {}
     ggml_cgraph * build() override;

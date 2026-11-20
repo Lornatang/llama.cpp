@@ -11,15 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 // ==============================================================================
-//
-//  fastvithd.cpp
-//  llama.cpp / mtmd
-//
-//  Loads Marvin Muse FastViT-HD weights and builds the ggml graph from RGB input
-//  to projected image tokens.
-//
-
-#include "models.h"
+#include "fastvithd.h"
+#include "../mtmd-graph.h"
 
 #include <algorithm>
 #include <array>
@@ -130,13 +123,24 @@ void load_fastvithd(mtmd_model & model, const std::function<ggml_tensor *(const 
     model.mm_2_b = get("mm.2.bias",   {text_dim, 1, 1, 1}, false);
 }
 
-/// Apply the exact GELU used by the PyTorch checkpoint.
-///
-/// @param x  Input activations.
-/// @return A tensor with the same shape as x.
-ggml_tensor * mtmd_graph_fastvithd::gelu_act(ggml_tensor * x) {
-    return ggml_gelu_erf(ctx0, x);
-}
+namespace {
+
+struct mtmd_graph_fastvithd : mtmd_graph {
+    mtmd_graph_fastvithd(mtmd_subcontext * ctx, const mtmd_image_f32 & img) : mtmd_graph(ctx, img), backend(ctx->backends.backend) {}
+    ggml_cgraph * build() override;
+
+private:
+    ggml_backend_t backend;
+
+    ggml_tensor * conv2d(const fastvit_conv2d & c, ggml_tensor * x, int stride, int pad, bool depthwise);
+    ggml_tensor * layer_scale(ggml_tensor * x, ggml_tensor * ls);
+    ggml_tensor * convffn(ggml_tensor * x, const fastvit_conv2d & dw, const fastvit_conv2d & fc1, const fastvit_conv2d & fc2);
+    ggml_tensor * repmixer_block(ggml_tensor * x, const fastvit_repmixer_block & blk);
+    ggml_tensor * mhsa(ggml_tensor * x, const fastvit_attn_block & blk);
+    ggml_tensor * attn_block(ggml_tensor * x, const fastvit_attn_block & blk);
+    ggml_tensor * downsample(ggml_tensor * x, const fastvit_conv2d & lkb, const fastvit_conv2d & pw);
+    ggml_tensor * se_block(ggml_tensor * x);
+};
 
 /// Build a convolution with an optional bias.
 ///
@@ -217,7 +221,7 @@ ggml_tensor * mtmd_graph_fastvithd::convffn(ggml_tensor *          x,
                                             const fastvit_conv2d & fc2) {
     ggml_tensor * cur = conv2d(dw, x, 1, 3, true);
     cur               = conv2d(fc1, cur, 1, 0, false);
-    cur               = gelu_act(cur);
+    cur               = ggml_gelu_erf(ctx0, cur);
     cur               = conv2d(fc2, cur, 1, 0, false);
     return cur;
 }
@@ -235,39 +239,10 @@ ggml_tensor * mtmd_graph_fastvithd::repmixer_block(ggml_tensor * x, const fastvi
     return ggml_add(ctx0, cur, ffn);
 }
 
-/// Normalize across channels independently at each spatial location.
+/// Normalize channels and build self-attention over the spatial positions of one image.
 ///
-/// @param x    Input activations in [width, height, channels, batch] order.
-/// @param w    Optional scale per channel.
-/// @param b    Optional bias per channel.
-/// @param eps  Epsilon added to the variance.
-/// @return Normalized activations in the same dimension order as x.
-ggml_tensor * mtmd_graph_fastvithd::channel_norm(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, float eps) {
-    const int64_t W = x->ne[0];
-    const int64_t H = x->ne[1];
-    const int64_t C = x->ne[2];
-    const int64_t B = x->ne[3];
-
-    // ggml_norm normalizes the first dimension.
-    ggml_tensor * cur = ggml_cont(ctx0, ggml_permute(ctx0, x, 1, 2, 0, 3));
-    cur               = ggml_reshape_3d(ctx0, cur, C, W * H, B);
-    cur               = ggml_norm(ctx0, cur, eps);
-    if (w) {
-        cur = ggml_mul(ctx0, cur, w);
-    }
-    if (b) {
-        cur = ggml_add(ctx0, cur, b);
-    }
-    cur = ggml_cont(ctx0, cur);
-    cur = ggml_reshape_4d(ctx0, cur, C, W, H, B);
-    cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 2, 0, 1, 3));
-    return cur;
-}
-
-/// Build multi-head self-attention over the spatial positions of one image.
-///
-/// @param x    Normalized activations with batch size one and 32 channels per attention head.
-/// @param blk  Packed QKV and output projection weights.
+/// @param x    Input activations with batch size one and 32 channels per attention head.
+/// @param blk  Layer norm, packed QKV and output projection weights.
 /// @return Projected attention output on the input spatial grid.
 ggml_tensor * mtmd_graph_fastvithd::mhsa(ggml_tensor * x, const fastvit_attn_block & blk) {
     const int64_t W        = x->ne[0];
@@ -282,8 +257,8 @@ ggml_tensor * mtmd_graph_fastvithd::mhsa(ggml_tensor * x, const fastvit_attn_blo
     const float scale  = 1.0f / sqrtf((float) head_dim);
 
     // [W,H,C,B] -> [C,N]
-    ggml_tensor * cur = ggml_cont(ctx0, ggml_permute(ctx0, x, 1, 2, 0, 3));
-    cur               = ggml_reshape_2d(ctx0, cur, C, N);
+    ggml_tensor * cur = ggml_cont_2d(ctx0, ggml_permute(ctx0, x, 1, 2, 0, 3), C, N);
+    cur = build_norm(cur, blk.norm_w, blk.norm_b, NORM_TYPE_NORMAL, 1e-5f, -1);
 
     ggml_tensor * qkv = build_mm(blk.qkv_w, cur);
     if (blk.qkv_b) {
@@ -302,11 +277,7 @@ ggml_tensor * mtmd_graph_fastvithd::mhsa(ggml_tensor * x, const fastvit_attn_blo
     k = ggml_reshape_3d(ctx0, k, head_dim, n_head, N);
     v = ggml_reshape_3d(ctx0, v, head_dim, n_head, N);
 
-    ggml_tensor * attn = build_attn(nullptr, nullptr, q, k, v, nullptr, scale, -1);
-    attn = build_mm(blk.proj_w, attn);
-    if (blk.proj_b) {
-        attn = ggml_add(ctx0, attn, blk.proj_b);
-    }
+    ggml_tensor * attn = build_attn(blk.proj_w, blk.proj_b, q, k, v, nullptr, scale, -1);
 
     attn = ggml_cont(ctx0, attn);
     attn = ggml_reshape_4d(ctx0, attn, C, W, H, B);
@@ -320,8 +291,7 @@ ggml_tensor * mtmd_graph_fastvithd::mhsa(ggml_tensor * x, const fastvit_attn_blo
 /// @param blk  Normalization, attention, feed-forward and layer-scale weights.
 /// @return Activations after both residual additions.
 ggml_tensor * mtmd_graph_fastvithd::attn_block(ggml_tensor * x, const fastvit_attn_block & blk) {
-    ggml_tensor * h = channel_norm(x, blk.norm_w, blk.norm_b);
-    h               = mhsa(h, blk);
+    ggml_tensor * h = mhsa(x, blk);
     h               = layer_scale(h, blk.ls1);
     x               = ggml_add(ctx0, x, h);
 
@@ -338,9 +308,9 @@ ggml_tensor * mtmd_graph_fastvithd::attn_block(ggml_tensor * x, const fastvit_at
 /// @return Activations on the reduced spatial grid.
 ggml_tensor * mtmd_graph_fastvithd::downsample(ggml_tensor * x, const fastvit_conv2d & lkb, const fastvit_conv2d & pw) {
     ggml_tensor * cur = conv2d(lkb, x, 2, 3, true);
-    cur               = gelu_act(cur);
+    cur               = ggml_gelu_erf(ctx0, cur);
     cur               = conv2d(pw, cur, 1, 0, false);
-    cur               = gelu_act(cur);
+    cur               = ggml_gelu_erf(ctx0, cur);
     return cur;
 }
 
@@ -367,9 +337,9 @@ ggml_tensor * mtmd_graph_fastvithd::se_block(ggml_tensor * x) {
 ggml_cgraph * mtmd_graph_fastvithd::build() {
     ggml_tensor * cur = build_inp_raw();
 
-    cur = gelu_act(conv2d(model.fastvit.stem[0], cur, 2, 1, false));
-    cur = gelu_act(conv2d(model.fastvit.stem[1], cur, 2, 1, true));
-    cur = gelu_act(conv2d(model.fastvit.stem[2], cur, 1, 0, false));
+    cur = ggml_gelu_erf(ctx0, conv2d(model.fastvit.stem[0], cur, 2, 1, false));
+    cur = ggml_gelu_erf(ctx0, conv2d(model.fastvit.stem[1], cur, 2, 1, true));
+    cur = ggml_gelu_erf(ctx0, conv2d(model.fastvit.stem[2], cur, 1, 0, false));
     cb(cur, "fv_stem", -1);
 
     for (int i = 0; i < 3; ++i) {
@@ -392,7 +362,7 @@ ggml_cgraph * mtmd_graph_fastvithd::build() {
 
     cur = conv2d(model.fastvit.conv_exp, cur, 1, 1, true);
     cur = se_block(cur);
-    cur = gelu_act(cur);
+    cur = ggml_gelu_erf(ctx0, cur);
     cb(cur, "fv_conv_exp", -1);
 
     // Flatten the spatial grid in row-major order before projecting the tokens.
@@ -411,4 +381,10 @@ ggml_cgraph * mtmd_graph_fastvithd::build() {
 
     ggml_build_forward_expand(gf, emb);
     return gf;
+}
+
+} // namespace
+
+std::unique_ptr<mtmd_graph> make_fastvithd_graph(mtmd_subcontext * ctx, const mtmd_image_f32 & img) {
+    return std::make_unique<mtmd_graph_fastvithd>(ctx, img);
 }
