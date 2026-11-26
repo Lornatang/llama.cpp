@@ -46,7 +46,6 @@ add_library(mtmd
             models/dots3note.cpp
             models/dotsocr.cpp
             models/exaone4_5.cpp
-            models/fastvithd.cpp
             models/gemma4a.cpp
             models/gemma4v.cpp
             models/gemma4ua.cpp

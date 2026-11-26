@@ -1108,6 +1108,7 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                 set_input_i32("merger_ds_idx_2", m_ds_2);
                 set_input_i32("merger_ds_idx_3", m_ds_3);
             } break;
+        case PROJECTOR_TYPE_MARVIN_MUSE:
         case PROJECTOR_TYPE_LFM3VL:
             {
                 // patches in raster-scan order (no interleave before encoder layers)
@@ -1865,7 +1866,6 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         case PROJECTOR_TYPE_COGVLM:
         case PROJECTOR_TYPE_YASA2:
         case PROJECTOR_TYPE_GEMMA4UA:
-        case PROJECTOR_TYPE_MARVIN_MUSE:
         case PROJECTOR_TYPE_MUSE_SPARK_AUDIO:
         case PROJECTOR_TYPE_QWEN3TTS_SPKENC:
         case PROJECTOR_TYPE_ZONOS3_SPKENC:

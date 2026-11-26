@@ -179,7 +179,7 @@ class LFM3D1Model(LFM3Model):
 class LFM3VLVisionMixin(MmprojModel):
     """LFM3-VL vision tower and projector, shared with LFM3-Omni."""
 
-    def _set_lfm3vl_gguf_parameters(self):
+    def _set_lfm3vl_gguf_parameters(self, proj_type=gguf.VisionProjectorType.LFM3VL):
         assert self.hparams_vision is not None
         # mtmd hardcodes the GELU projector and its input norm eps
         if (self.global_config["projector_hidden_act"] != "gelu" or not self.global_config["projector_bias"]
@@ -189,7 +189,7 @@ class LFM3VLVisionMixin(MmprojModel):
         if (self.hparams_vision["rope_parameters"]["rope_theta"] != 1e6 or self.hparams_vision["in_channels"] != 3
                 or self.hparams_vision["conv_kernel_size"] != 3):
             raise ValueError("unsupported vision rope_theta / in_channels / conv_kernel_size")
-        self.gguf_writer.add_clip_vision_projector_type(gguf.VisionProjectorType.LFM3VL)
+        self.gguf_writer.add_clip_vision_projector_type(proj_type)
         self.gguf_writer.add_vision_head_count_kv(self.hparams_vision["num_key_value_heads"])
         self.gguf_writer.add_vision_spatial_merge_size(self.global_config["downsample_factor"])
         self.gguf_writer.add_vision_attention_layernorm_eps(self.hparams_vision["norm_eps"])

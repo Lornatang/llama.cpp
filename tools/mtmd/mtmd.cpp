@@ -1062,7 +1062,7 @@ struct mtmd_context {
                 } break;
             case PROJECTOR_TYPE_MARVIN_MUSE:
                 {
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_marvin_muse>(models.v.get());
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_lfm3vl>(models.v.get());
                 } break;
             case PROJECTOR_TYPE_MINICPMV:
                 {

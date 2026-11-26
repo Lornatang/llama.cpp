@@ -92,15 +92,6 @@ struct img_tool {
         }
     }
 
-    // Center on a black square before resizing, without allocating the padded image.
-    static void resize_padded_square(const mtmd_image_u8 & src, mtmd_image_u8 & dst, int size, resize_algo algo) {
-        if (src.is_placeholder() || src.get_size().width == src.get_size().height) {
-            resize(src, dst, {size, size}, algo, PAD_NONE);
-        } else {
-            resize_pillow(src, dst, size, size, algo, true);
-        }
-    }
-
     static void crop(const mtmd_image_u8 & image, mtmd_image_u8 & dst, int x, int y, int w, int h) {
         GGML_ASSERT(x >= 0 && y >= 0 && w > 0 && h > 0);
         GGML_ASSERT(x + w <= image.get_size().width && y + h <= image.get_size().height);
@@ -221,8 +212,7 @@ private:
             mtmd_image_u8 & dst,
             int target_width,
             int target_height,
-            resize_algo algo,
-            bool pad_square = false) {
+            resize_algo algo) {
         // Fixed-point precision: 22 bits = 32 (int32_t) - 8 (uint8_t pixels) - 2 (headroom for accumulation)
         // This allows encoding fractional weights as integers: weight * 2^22
         const int PRECISION_BITS = 32 - 8 - 2;
@@ -393,22 +383,6 @@ private:
             return ksize;
         };
 
-        // Drop taps on the black padding after normalizing and rounding the weights.
-        auto clip_weights = [](int offset, int length, int ksize, std::vector<int> & bounds, std::vector<int32_t> & weights) {
-            for (size_t i = 0; i < bounds.size() / 2; ++i) {
-                const int start = bounds[2 * i] - offset;
-                const int end   = start + bounds[2 * i + 1];
-                const int lo = std::clamp(start, 0, length);
-                const int hi = std::clamp(end,   0, length);
-                bounds[2 * i]     = lo;
-                bounds[2 * i + 1] = hi - lo;
-                if (lo > start && hi > lo) {
-                    auto * row = weights.data() + i * ksize;
-                    std::copy(row + (lo - start), row + (hi - start), row);
-                }
-            }
-        };
-
         // Horizontal resampling pass
         // Resizes width from src to out_nx, preserving height
         auto resample_horizontal = [&](const uint8_t * src, int in_nx, int in_ny,
@@ -492,9 +466,6 @@ private:
         // Main resampling logic using separable two-pass approach
         const int src_width     = img.get_size().width;
         const int src_height    = img.get_size().height;
-        const int side          = std::max(src_width, src_height);
-        const int filter_width  = pad_square ? side : src_width;
-        const int filter_height = pad_square ? side : src_height;
 
         // sanity check on the target size
         if (target_width <= 0 || target_width > 65536 || target_height <= 0 || target_height > 65536) {
@@ -502,8 +473,8 @@ private:
                                      std::to_string(target_height) + " is out of range (max 65536)");
         }
 
-        bool need_horizontal = target_width != filter_width || filter_width != src_width;
-        bool need_vertical = target_height != filter_height || filter_height != src_height;
+        bool need_horizontal = target_width != src_width;
+        bool need_vertical = target_height != src_height;
 
         // Precompute filter coefficients for both dimensions
         std::vector<int> bounds_horiz, bounds_vert;
@@ -511,17 +482,11 @@ private:
         int ksize_horiz = 0, ksize_vert = 0;
 
         if (need_horizontal) {
-            ksize_horiz = precompute_weights(filter_width, target_width, bounds_horiz, weights_horiz);
-            if (filter_width != src_width) {
-                clip_weights((filter_width - src_width) / 2, src_width, ksize_horiz, bounds_horiz, weights_horiz);
-            }
+            ksize_horiz = precompute_weights(src_width, target_width, bounds_horiz, weights_horiz);
         }
 
         if (need_vertical) {
-            ksize_vert = precompute_weights(filter_height, target_height, bounds_vert, weights_vert);
-            if (filter_height != src_height) {
-                clip_weights((filter_height - src_height) / 2, src_height, ksize_vert, bounds_vert, weights_vert);
-            }
+            ksize_vert = precompute_weights(src_height, target_height, bounds_vert, weights_vert);
         }
 
         // Perform two-pass resampling
@@ -820,15 +785,6 @@ mtmd_image_preproc_out mtmd_image_preprocessor_fixed_size::preprocess(const mtmd
                         hparams.image_pad_color);
     mtmd_image_preproc_out output;
     output.append(hparams, resized_image, true);
-    return output;
-}
-
-mtmd_image_preproc_out mtmd_image_preprocessor_marvin_muse::preprocess(const mtmd_image_u8 & img) const {
-    mtmd_image_u8 resized;
-    const auto algo = static_cast<resize_algo>(RESIZE_ALGO_BICUBIC | RESIZE_ALGO_FLAG_TORCH);
-    img_tool::resize_padded_square(img, resized, hparams.image_size, algo);
-    mtmd_image_preproc_out output;
-    output.append(hparams, resized, true);
     return output;
 }
 

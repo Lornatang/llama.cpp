@@ -3,30 +3,23 @@
 # ==============================================================================
 """Exercise Marvin GGUF conversion without downloading model weights.
 
-The synthetic checkpoint uses the production block layout with smaller
-channels. Set ``MARVIN_MUSE_MMPROJ_TEST`` to the path to ``test-mtmd-impl`` to also
-load the F16 export and encode an image on the CPU.
+The synthetic checkpoint has one attention block and one spatial-convolution block. Set ``MARVIN_MUSE_MMPROJ_TEST`` to the path to ``test-mtmd-impl`` to also
+load the export and encode images on the CPU.
 """
 
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
-import torch
-import torch.nn.functional as F
 from safetensors.numpy import save_file
 
 from conversion import get_model_class
 from conversion.base import gguf
-from conversion.marvin import MarvinMuseVisionModel, _fuse_conv_bn
-
-ROOT = Path(__file__).resolve().parents[1]
-
+from conversion.marvin import MarvinMuseVisionModel
 
 class TestMarvinTextConversion(unittest.TestCase):
     """Check architecture dispatch and keep vision weights out of text exports."""
@@ -59,220 +52,154 @@ class TestMarvinTextConversion(unittest.TestCase):
                 self.assertEqual(list(model.model_tensors), ["model.embed_tokens.weight"])
 
 
-def fixture_tensors():
-    """Create a small FastViT-HD checkpoint with the production block layout.
-
-    Returns:
-        dict[str, np.ndarray]: Synthetic weights keyed by Hugging Face tensor name.
-    """
-    tensors = {}
-    prefix = "vision_tower.vision_model.backbone."
-
-    def put(name, shape, value=0.0):
-        tensors[prefix + name] = np.full(shape, value, dtype=np.float32)
-
-    def conv(name, in_ch, out_ch, kernel, depthwise=False):
-        put(name + ".weight", (out_ch, 1 if depthwise else in_ch, kernel, kernel), 0.001)
-        put(name + ".bias", (out_ch,))
-
-    def ffn(net, block, channels):
-        name = f"network.{net}.{block}.convffn"
-        put(name + ".conv.conv.weight", (channels, 1, 7, 7), 0.001)
-        for part, value in (("weight", 1), ("bias", 0), ("running_mean", 0), ("running_var", 1)):
-            put(name + ".conv.bn." + part, (channels,), value)
-        put(name + ".fc1.weight", (channels * 4, channels, 1, 1), 0.001)
-        put(name + ".fc1.bias", (channels * 4,))
-        put(name + ".fc2.weight", (channels, channels * 4, 1, 1), 0.001)
-        put(name + ".fc2.bias", (channels,))
-
-    conv("patch_embed.0.reparam_conv", 3, 4, 3)
-    conv("patch_embed.1.reparam_conv", 4, 4, 3, True)
-    conv("patch_embed.2.reparam_conv", 4, 4, 1)
-    for net, channels, count in ((0, 4, 2), (2, 8, 12), (4, 16, 24)):
-        for block in range(count):
-            conv(f"network.{net}.{block}.token_mixer.reparam_conv", channels, channels, 3, True)
-            put(f"network.{net}.{block}.layer_scale", (channels, 1, 1), 1)
-            ffn(net, block, channels)
-    for net, in_ch, out_ch in ((1, 4, 8), (3, 8, 16), (5, 16, 32), (8, 32, 32)):
-        conv(f"network.{net}.proj.0.lkb_reparam", in_ch, out_ch, 7, True)
-        conv(f"network.{net}.proj.1.reparam_conv", out_ch, out_ch, 1)
-    for net in (6, 9):
-        conv(f"network.{net}.reparam_conv", 32, 32, 7, True)
-    for net, count in ((7, 4), (10, 2)):
-        for block in range(count):
-            name = f"network.{net}.{block}"
-            put(name + ".norm.weight", (32,), 1)
-            put(name + ".norm.bias", (32,))
-            put(name + ".layer_scale_1", (32, 1, 1), 1)
-            put(name + ".layer_scale_2", (32, 1, 1), 1)
-            put(name + ".token_mixer.qkv.weight", (96, 32), 0.001)
-            put(name + ".token_mixer.proj.weight", (32, 32), 0.001)
-            put(name + ".token_mixer.proj.bias", (32,))
-            ffn(net, block, 32)
-    conv("conv_exp.reparam_conv", 32, 64, 3, True)
-    conv("conv_exp.se.reduce", 64, 4, 1)
-    conv("conv_exp.se.expand", 4, 64, 1)
-    for index, in_ch in ((0, 64), (2, 32)):
-        tensors[f"mm_projector.{index}.weight"] = np.full((32, in_ch), 0.001, dtype=np.float32)
-        tensors[f"mm_projector.{index}.bias"] = np.zeros((32,), dtype=np.float32)
-    return tensors
-
-
 class TestMarvinMuseConversion(unittest.TestCase):
     """Check conversion and optionally run the exported projector on the CPU."""
 
-    @classmethod
-    def setUpClass(cls):
-        cls.tensors = fixture_tensors()
-
-    def make_checkpoint(self, directory, *, size=1024, tensors=None, overrides=None):
-        """Write a synthetic Hugging Face checkpoint for one conversion test.
-
-        Args:
-            directory (Path): Directory for the checkpoint and processor configuration.
-            size (int): Square image size declared by the vision config.
-            tensors (dict[str, np.ndarray] | None): Replacement weights for a test case.
-            overrides (dict | None): Overrides for top-level model configuration keys.
-        """
+    def make_checkpoint(self, directory, *, projector="mlp2x_gelu", override=None, tensor_override=None):
+        vision = {
+            "model_type": "lfm3_vl_vision",
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+            "conv_kernel_size": 3,
+            "in_channels": 3,
+            "rope_parameters": {"rope_theta": 1e6},
+            "norm_eps": 1e-5,
+        }
         config = {
             "architectures": ["MarvinMuseForConditionalGeneration"],
             "model_type": "marvin_muse",
             "hidden_size": 32,
             "mm_hidden_size": 64,
-            "num_hidden_layers": 1,
-            "vision_config": {"layers": [2, 12, 24, 4, 2], "embed_dims": [4, 8, 16, 32, 32], "image_size": size, "patch_size": 64},
+            "mm_projector_type": projector,
+            "image_aspect_ratio": "dynamic_resolution",
+            "mm_vision_config": vision,
+            "mm_vision_projector_config": {
+                "model_type": "lfm3_vl",
+                "vision_config": vision,
+                "text_config": {"hidden_size": 64},
+                "projector_hidden_size": 64,
+                "projector_hidden_act": "gelu",
+                "projector_bias": True,
+            },
+            **(override or {}),
         }
-        config.update(overrides or {})
+        processor = {
+            "image_processor_type": "MarvinMuseNativeImageProcessor",
+            "do_resize": True,
+            "do_rescale": True,
+            "do_normalize": True,
+            "do_convert_rgb": True,
+            "rescale_factor": 1 / 255,
+            "image_mean": [0, 0, 0],
+            "image_std": [1, 1, 1],
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+            "size": {"shortest_edge": 1024, "longest_edge": 16384},
+            "resample": 3,
+        }
         Path(directory, "config.json").write_text(json.dumps(config), encoding="utf-8")
-        # Integer input exercises the converter's float32 GGUF metadata normalization.
-        Path(directory, "preprocessor_config.json").write_text(json.dumps({"image_mean": [0, 0, 0], "image_std": [1, 1, 1]}), encoding="utf-8")
-        save_file(self.tensors if tensors is None else tensors, str(directory / "model.safetensors"))
+        Path(directory, "preprocessor_config.json").write_text(json.dumps(processor), encoding="utf-8")
+
+        encoder = "model.vision_tower.vision_tower.encoder."
+        merger = "model.vision_tower.vision_tower.projector."
+        shapes = {
+            encoder + "patchifier.weight": (32, 1536),
+            encoder + "embedding_norm.weight": (32,),
+            encoder + "layers.0.self_attn.q_proj.weight": (32, 32),
+            encoder + "layers.0.self_attn.k_proj.weight": (16, 32),
+            encoder + "layers.0.self_attn.v_proj.weight": (16, 32),
+            encoder + "layers.0.self_attn.out_proj.weight": (32, 32),
+            encoder + "layers.0.self_attn.q_layernorm.weight": (8,),
+            encoder + "layers.0.self_attn.k_layernorm.weight": (8,),
+            encoder + "layers.1.conv.in_proj.weight": (96, 32),
+            encoder + "layers.1.conv.spatial_conv.weight": (32, 1, 3, 3),
+            encoder + "layers.1.conv.out_proj.weight": (32, 32),
+            merger + "layer_norm.weight": (32,),
+            merger + "layer_norm.bias": (32,),
+            merger + "linear_1.weight": (64, 128),
+            merger + "linear_1.bias": (64,),
+            merger + "linear_2.weight": (64, 64),
+            merger + "linear_2.bias": (64,),
+        }
+        for layer in range(2):
+            prefix = encoder + f"layers.{layer}."
+            shapes.update({
+                prefix + "operator_norm.weight": (32,),
+                prefix + "ffn_norm.weight": (32,),
+                prefix + "feed_forward.w1.weight": (64, 32),
+                prefix + "feed_forward.w2.weight": (32, 64),
+                prefix + "feed_forward.w3.weight": (64, 32),
+            })
+        outer = {"model.mm_projector.": 64} if projector == "linear" else {"model.mm_projector.0.": 64, "model.mm_projector.2.": 32}
+        for prefix, width in outer.items():
+            shapes[prefix + "weight"] = (32, width)
+            shapes[prefix + "bias"] = (32,)
+        for name, shape in (tensor_override or {}).items():
+            if shape is None:
+                del shapes[name]
+            else:
+                shapes[name] = shape
+        rng = np.random.default_rng(128)
+        tensors = {key: rng.normal(0, 0.05, shape).astype(np.float32) for key, shape in shapes.items()}
+        save_file(tensors, str(Path(directory, "model.safetensors")))
 
     def convert(self, directory, outtype="f16"):
-        """Run the mmproj converter on a test checkpoint.
-
-        Args:
-            directory (Path): Directory containing the synthetic checkpoint.
-            outtype (str): GGUF output precision passed to the converter.
-
-        Returns:
-            tuple[subprocess.CompletedProcess, Path]: Process result with combined output and the requested GGUF path.
-        """
-        output = directory / f"model-{outtype}.gguf"
-        env = {**os.environ, "OMP_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "1"}
-        result = subprocess.run(
-            [sys.executable, str(ROOT / "convert_hf_to_gguf.py"), str(directory), "--mmproj", "--outtype", outtype, "--outfile", str(output)],
-            cwd=ROOT,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        return result, output
+        output = Path(directory, f"model-{outtype}.gguf")
+        file_type = {
+            "f16": gguf.LlamaFileType.MOSTLY_F16,
+            "f32": gguf.LlamaFileType.ALL_F32,
+            "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
+        }[outtype]
+        model = MarvinMuseVisionModel(directory, file_type, output)
+        model.write()
+        return output
 
     def test_formats_and_runtime(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            directory = Path(tmp)
-            self.make_checkpoint(directory)
-            for outtype, matrix_type in (
-                ("f16", gguf.GGMLQuantizationType.F16),
-                ("bf16", gguf.GGMLQuantizationType.BF16),
-                ("q8_0", gguf.GGMLQuantizationType.Q8_0),
-                ("f32", gguf.GGMLQuantizationType.F32),
-            ):
-                with self.subTest(outtype=outtype):
-                    result, output = self.convert(directory, outtype)
-                    self.assertEqual(result.returncode, 0, result.stdout[-4000:])
-                    reader = gguf.GGUFReader(output)
-                    self.assertEqual(reader.fields["clip.projector_type"].contents(), "marvin_muse")
-                    tensors = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
-                    self.assertEqual(tensors["mm.0.weight"], matrix_type)
-                    self.assertEqual(tensors["v.fastvit.net.7.blk.0.qkv.weight"], matrix_type)
-                    self.assertEqual(
-                        tensors["v.fastvit.stem.0.weight"], gguf.GGMLQuantizationType.F32 if outtype == "f32" else gguf.GGMLQuantizationType.F16
-                    )
-                    self.assertEqual(tensors["v.fastvit.net.0.blk.0.ls.weight"], gguf.GGMLQuantizationType.F32)
-                    for key in ("image_mean", "image_std"):
-                        self.assertEqual(reader.fields[f"clip.vision.{key}"].types, [gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.FLOAT32])
-                    del reader
-                    if outtype == "f16" and (runtime := os.environ.get("MARVIN_MUSE_MMPROJ_TEST")):
-                        result = subprocess.run([runtime, "--marvin-muse-mmproj", str(output)], capture_output=True, text=True)
-                        self.assertEqual(result.returncode, 0, result.stderr[-4000:])
+        for projector, outtype, matrix_type in (
+            ("mlp2x_gelu", "f16", gguf.GGMLQuantizationType.F16),
+            ("mlp2x_gelu", "q8_0", gguf.GGMLQuantizationType.Q8_0),
+            ("linear", "f32", gguf.GGMLQuantizationType.F32),
+        ):
+            with self.subTest(outtype=outtype), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                self.make_checkpoint(directory, projector=projector)
+                output = self.convert(directory, outtype)
+                reader = gguf.GGUFReader(output)
+                self.assertEqual(reader.fields["clip.vision.projector_type"].contents(), "marvin_muse")
+                self.assertEqual(reader.fields["clip.vision.spatial_merge_size"].contents(), 2)
+                tensors = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+                for name in ("mm.0.weight", "mm.2.weight", "mm.3.weight", "v.blk.0.attn_q.weight"):
+                    self.assertEqual(tensors[name], matrix_type)
+                self.assertEqual("mm.4.weight" in tensors, projector == "mlp2x_gelu")
+                self.assertEqual(tensors["v.patch_embd.weight"], gguf.GGMLQuantizationType.F16)
+                self.assertEqual(tensors["v.patch_embd.weight.1"], gguf.GGMLQuantizationType.F16)
+                self.assertEqual(tensors["v.blk.1.conv2d_spatial.weight"], gguf.GGMLQuantizationType.F32)
+                for key in ("image_mean", "image_std"):
+                    self.assertEqual(reader.fields[f"clip.vision.{key}"].types, [gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.FLOAT32])
+                if runtime := os.environ.get("MARVIN_MUSE_MMPROJ_TEST"):
+                    run = subprocess.run([runtime, "--marvin-muse-mmproj", str(output)], capture_output=True, text=True)
+                    self.assertEqual(run.returncode, 0, run.stderr[-4000:])
 
-    def test_incomplete_bn_and_missing_backbone_fail(self):
-        missing_bn = dict(self.tensors)
-        del missing_bn["vision_tower.vision_model.backbone.network.0.0.convffn.conv.bn.running_var"]
-        missing_bias = dict(self.tensors)
-        del missing_bias["mm_projector.0.bias"]
-        only_projector = {k: v for k, v in self.tensors.items() if k.startswith("mm_projector.")}
-        for tensors, error in (
-            (missing_bn, "incomplete ConvFFN batch normalization"),
-            (missing_bias, "required vision/projector tensors"),
-            (only_projector, "required vision/projector tensors"),
+    def test_rejects_incompatible_config_and_tensors(self):
+        for override, tensor_override, error in (
+            ({"vision_config": {"model_type": "fastvithd"}}, {}, "requires native LFM3-VL"),
+            ({"image_aspect_ratio": "pad"}, {}, "requires dynamic resolution"),
+            ({}, {"model.mm_projector.2.bias": None}, "Missing native Marvin Muse"),
+            ({}, {"model.mm_projector.2.weight": (32, 33)}, "Unexpected native Marvin Muse"),
         ):
             with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
-                self.make_checkpoint(directory, tensors=tensors)
-                result, output = self.convert(directory)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(error, result.stdout)
-                self.assertFalse(output.exists())
-
-    def test_invalid_resolution_fails(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            directory = Path(tmp)
-            self.make_checkpoint(directory, size=512)
-            result, output = self.convert(directory)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("unsupported image_size=512", result.stdout)
-            self.assertFalse(output.exists())
-
-    def test_incompatible_projector(self):
-        bad_shape = {**self.tensors, "mm_projector.2.weight": np.zeros((32, 33), dtype=np.float32)}
-        for overrides, tensors, error in (
-            ({"mm_projector_type": "mlp3x_gelu"}, None, "unsupported mm_projector_type"),
-            ({"mm_patch_merge_type": "spatial_unpad"}, None, "unsupported mm_patch_merge_type"),
-            ({}, bad_shape, "unexpected tensor mm.2.weight"),
-        ):
-            with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp:
-                directory = Path(tmp)
-                self.make_checkpoint(directory, tensors=tensors, overrides=overrides)
-                result, output = self.convert(directory)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(error, result.stdout)
-                self.assertFalse(output.exists())
-
-    def test_bn_fusion_and_counter_order(self):
-        torch.manual_seed(4)
-        x = torch.randn(1, 4, 9, 9)
-        weight = torch.randn(4, 1, 3, 3)
-        gamma, beta, mean = torch.randn(4), torch.randn(4), torch.randn(4)
-        var = torch.rand(4) + 0.5
-        fused_w, fused_b = _fuse_conv_bn(weight, gamma, beta, mean, var)
-        expected = F.batch_norm(F.conv2d(x, weight, groups=4), mean, var, gamma, beta, training=False)
-        actual = F.conv2d(x, fused_w, fused_b, groups=4)
-        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
-
-        model = object.__new__(MarvinMuseVisionModel)
-        model._ffn_bn_buf = {}
-        model._emitted_tensors = set()
-        model._expected_shapes = {
-            "v.fastvit.net.0.blk.0.ffn.dw.weight": (4, 1, 3, 3),
-            "v.fastvit.net.0.blk.0.ffn.dw.bias": (4,),
-        }
-        prefix = "vision_tower.vision_model.backbone.network.0.0.convffn.conv."
-        parts = (
-            ("conv.weight", weight),
-            ("bn.weight", gamma),
-            ("bn.bias", beta),
-            ("bn.running_mean", mean),
-            ("bn.running_var", var),
-            ("bn.num_batches_tracked", torch.tensor(1)),
-        )
-        for name, data in parts:
-            list(model._map_network(prefix + name, data))
-        self.assertFalse(model._ffn_bn_buf)
-        self.assertIn("v.fastvit.net.0.blk.0.ffn.dw.weight", model._emitted_tensors)
+                self.make_checkpoint(directory, override=override, tensor_override=tensor_override)
+                with self.assertRaisesRegex(ValueError, error):
+                    self.convert(directory)
+                self.assertFalse(Path(directory, "model-f16.gguf").exists())
 
 
 if __name__ == "__main__":

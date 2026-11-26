@@ -766,10 +766,6 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
             {
                 builder = std::make_unique<mtmd_graph_mobilenetv5>(ctx, img);
             } break;
-        case PROJECTOR_TYPE_MARVIN_MUSE:
-            {
-                builder = make_fastvithd_graph(ctx, img);
-            } break;
         case PROJECTOR_TYPE_GEMMA4V:
             {
                 builder = std::make_unique<mtmd_graph_gemma4v>(ctx, img);
@@ -809,6 +805,7 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
             {
                 builder = std::make_unique<mtmd_graph_sensenova_u1>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_MARVIN_MUSE:
         case PROJECTOR_TYPE_LFM3VL:
             {
                 builder = std::make_unique<mtmd_graph_lfm3vl>(ctx, img);

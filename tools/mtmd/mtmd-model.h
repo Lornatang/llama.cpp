@@ -3,7 +3,6 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "mtmd-impl.h"
-#include "models/fastvithd.h"
 
 #include <algorithm>
 #include <array>
@@ -1325,7 +1324,6 @@ struct mtmd_model {
     ggml_tensor * mobilenet_stem_norm_w = nullptr;
     ggml_tensor * mm_post_proj_norm_w = nullptr;
 
-    fastvit_weights fastvit;
 
     // Multi-Scale Fusion Adapter (MSFA) components
     ggml_tensor * msfa_concat_conv_w = nullptr;

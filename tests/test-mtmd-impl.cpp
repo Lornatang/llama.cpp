@@ -179,46 +179,6 @@ static uint32_t hash_pixels(const mtmd_image_u8 & img, uint32_t hash = 216613626
     return hash;
 }
 
-MAKE_TEST(test_image_preprocessor_marvin_muse) {
-    mtmd_hparams hparams;
-    hparams.image_size = 64;
-    for (int i = 0; i < 3; ++i) {
-        hparams.image_mean[i] = 0.0f;
-        hparams.image_std[i] = 1.0f;
-    }
-    const mtmd_image_preprocessor_marvin_muse preproc(hparams);
-    // Reference hashes use MarvinMuseImageProcessorFast with TorchVision bicubic resize.
-    const std::vector<std::pair<mtmd_image_size, uint32_t>> cases = {
-        { {81, 30}, 0xdabaaa8d },
-        { {30, 81}, 0x95191c51 },
-        { {81, 81}, 0x09575288 },
-        { {7, 11},  0xa48ae9ac },
-        { {64, 64}, 0xb69fe616 },
-        { {64, 7},  0x01c58a94 },
-        { {7, 64},  0x7ff97d18 },
-        { {1025, 7}, 0xaa8af486 },
-        { {7, 1025}, 0x26f45a11 },
-    };
-    for (const auto & [size, expected] : cases) {
-        const auto output = preproc.preprocess(make_test_image(size));
-        if (!t.assert_equal("image count", size_t(1), output.entries.size())) {
-            continue;
-        }
-        const auto & img = output.entries[0];
-        t.assert_equal("output width", 64, img.nx());
-        t.assert_equal("output height", 64, img.ny());
-        uint32_t hash = 2166136261u;
-        for (float pixel : img.get_ro_buf()) {
-            hash = (hash ^ static_cast<uint8_t>(std::lround(pixel * 255.0f))) * 16777619u;
-        }
-        t.assert_equal("pixels of " + image_size_to_str(size), expected, hash);
-    }
-    mtmd_image_u8 placeholder;
-    placeholder.set_size({81, 30}, true);
-    const auto output = preproc.preprocess(placeholder);
-    t.assert_true("placeholder remains a placeholder", output.entries.size() == 1 && output.entries[0].is_placeholder());
-}
-
 MAKE_TEST(test_image_preprocessor_lfm2) {
     mtmd_hparams hparams;
     hparams.patch_size = 16;
@@ -1116,14 +1076,18 @@ static int test_marvin_muse_mmproj(const char * path) {
         }
         mtmd_backends backends(nullptr, 2, models.v->max_nodes, nullptr, nullptr);
         mtmd_subcontext ctx(*models.v, backends, {MTMD_FLASH_ATTN_TYPE_DISABLED, false});
-        const auto images = mtmd_image_preprocessor_marvin_muse(models.v.get()).preprocess(make_test_image({81, 30}));
-        const auto & image = images.entries.at(0);
-        const int tokens = models.v->n_output_tokens(&image);
-        const int width = models.v->n_mmproj_embd();
-        std::vector<float> output(tokens * width);
-        if (tokens != 256 || width != 32 || !ctx.encode_image(2, &image, output)
-                || !std::all_of(output.begin(), output.end(), [](float v) { return std::isfinite(v); })) {
-            throw std::runtime_error("Marvin Muse fixture did not produce finite 256 x 32 embeddings");
+        const auto preproc = mtmd_image_preprocessor_lfm3vl(models.v.get());
+        for (const auto & [size, expected_tokens] : std::vector<std::pair<mtmd_image_size, int>>{
+                {{64, 64}, 4}, {{96, 32}, 3}, {{32, 96}, 3}, {{81, 30}, 3}}) {
+            const auto images = preproc.preprocess(make_test_image(size));
+            const auto & image = images.entries.at(0);
+            const int tokens = models.v->n_output_tokens(&image);
+            const int width = models.v->n_mmproj_embd();
+            std::vector<float> output(tokens * width);
+            if (tokens != expected_tokens || width != 32 || !ctx.encode_image(2, &image, output)
+                    || !std::all_of(output.begin(), output.end(), [](float v) { return std::isfinite(v); })) {
+                throw std::runtime_error("invalid Marvin Muse output for " + image_size_to_str(size));
+            }
         }
         return 0;
     } catch (const std::exception & e) {

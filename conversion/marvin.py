@@ -12,12 +12,12 @@
 # limitations under the License.
 # ==============================================================================
 import math
-import re
-from typing import Any, Callable, Dict, Iterable, Tuple
+from typing import Iterable
 
 import torch
 
-from .base import MmprojModel, ModelBase, gguf, logger
+from .base import ModelBase, gguf
+from .lfm3 import LFM3VLVisionMixin
 from .qwen import Qwen3_5TextModel, Qwen3Model
 
 
@@ -37,412 +37,115 @@ class MarvinVerseTextModel(Qwen3_5TextModel):
     no_mtp = True
 
 
-_STAGES = ((0, 2), (2, 12), (4, 24), (7, 4), (10, 2))
-_WIDTHS = (96, 192, 384, 768, 1536)
-_STAGE_CONVS = {"proj.0.lkb_reparam": "down.0", "proj.1.reparam_conv": "down.1", "reparam_conv": "pos"}
-_BLOCK_LAYERS = {
-    "token_mixer.reparam_conv": "mixer",
-    "norm": "norm",
-    "token_mixer.qkv": "qkv",
-    "token_mixer.proj": "proj",
-    "convffn.fc1": "ffn.fc1",
-    "convffn.fc2": "ffn.fc2",
-}
-_LAYER_SCALES = {"layer_scale": "ls", "layer_scale_1": "ls1", "layer_scale_2": "ls2"}
-_FFN_BN_PARTS = ("conv.weight", "bn.weight", "bn.bias", "bn.running_mean", "bn.running_var")
-
-
-def _fuse_conv_bn(
-    weight: torch.Tensor,
-    bn_weight: torch.Tensor,
-    bn_bias: torch.Tensor,
-    running_mean: torch.Tensor,
-    running_var: torch.Tensor,
-    eps: float = 1e-5,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Fuse a Conv2d and BatchNorm2d into a single conv weight/bias pair.
-
-    Args:
-        weight (torch.Tensor): Conv2d weight of shape ``[out_c, in_c, kH, kW]``.
-        bn_weight (torch.Tensor): BatchNorm affine scale (gamma), shape ``[out_c]``.
-        bn_bias (torch.Tensor): BatchNorm affine bias (beta), shape ``[out_c]``.
-        running_mean (torch.Tensor): BatchNorm running mean, shape ``[out_c]``.
-        running_var (torch.Tensor): BatchNorm running variance, shape ``[out_c]``.
-        eps (float): BatchNorm epsilon used in the variance denominator. Defaults to ``1e-5``.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Float32 convolution weights in the original layout and a bias of shape ``[out_c]``.
-    """
-    weight, bn_weight, bn_bias, running_mean, running_var = (
-        t.to(torch.float32) for t in (weight, bn_weight, bn_bias, running_mean, running_var)
-    )
-    std = (running_var + eps).sqrt()
-    scale = (bn_weight / std).reshape(-1, 1, 1, 1)
-    fused_w = weight * scale
-    fused_b = bn_bias - running_mean * bn_weight / std
-    return fused_w, fused_b
-
 
 @ModelBase.register("MarvinMuseForConditionalGeneration")
-class MarvinMuseVisionModel(MmprojModel):
-    """Export the Marvin Muse vision tower and MLP projector as an mmproj GGUF.
+class MarvinMuseVisionModel(LFM3VLVisionMixin):
+    """Export the LFM3-VL tower and both of Muse's projectors."""
 
-    Attributes:
-        block_count (int): Synthetic block count for the mmproj tensor map.
-        tensor_map: GGUF tensor name map for ``MODEL_ARCH.MMPROJ``.
-        _ffn_bn_buf (dict[str, dict[str, torch.Tensor]]): Per-block buffer for ConvFFN convolution and batch normalization tensors.
-        _expected_shapes (dict[str, tuple[int, ...]]): PyTorch dimension order for each required GGUF tensor.
-        _emitted_tensors (set[str]): Required tensor names already emitted by the converter.
-    """
+    _encoder = "model.vision_tower.vision_tower.encoder."
+    _patch_merger = "model.vision_tower.vision_tower.projector."
+    _projector = "model.mm_projector."
 
-    _ffn_bn_buf: dict[str, dict[str, torch.Tensor]]
+    def get_vision_config(self):
+        vision = self.global_config.get("mm_vision_config")
+        merger = self.global_config.get("mm_vision_projector_config")
+        if (not isinstance(vision, dict) or vision.get("model_type") != "lfm3_vl_vision"
+                or not isinstance(merger, dict) or merger.get("model_type") != "lfm3_vl"
+                or any(key in self.global_config for key in ("vision_config", "lfm3_vl_config", "siglip2_vision_config"))):
+            raise ValueError("Marvin Muse requires native LFM3-VL vision and patch merger settings.")
+        if (vision["spatial_merge_size"] != 2 or vision["temporal_patch_size"] != 2
+                or type(vision["patch_size"]) is not int or vision["patch_size"] <= 0
+                or vision["hidden_size"] != merger["vision_config"]["hidden_size"]
+                or vision["spatial_merge_size"] != merger["vision_config"]["spatial_merge_size"]
+                or self.global_config["mm_hidden_size"] != merger["text_config"]["hidden_size"]):
+            raise ValueError("Marvin Muse has unsupported patch geometry or mismatched projector widths.")
+        if (self.global_config["image_aspect_ratio"] != "dynamic_resolution"
+                or self.global_config.get("mm_patch_merge_type", "flat") != "flat"):
+            raise ValueError("Marvin Muse requires dynamic resolution and flat patch merging.")
+        if self.global_config["mm_projector_type"] not in ("linear", "mlp2x_gelu"):
+            raise ValueError("Marvin Muse requires a linear or mlp2x_gelu projector for GGUF.")
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initialize the Marvin Muse vision converter and validate the checkpoint configuration.
-
-        Args:
-            *args (Any): Positional arguments forwarded to ``MmprojModel``.
-            **kwargs (Any): Keyword args forwarded to ``MmprojModel``.
-
-        Raises:
-            ValueError: If the model architecture or preprocessing configuration is unsupported.
-        """
-        super().__init__(*args, **kwargs)
-        self._ffn_bn_buf = {}
-        self._validate_config()
-        self._expected_shapes = self._tensor_shapes()
-        self._emitted_tensors: set[str] = set()
-
-    def _tensor_shapes(self) -> dict[str, tuple[int, ...]]:
-        """Build the tensor shape requirements for the configured FastViT-HD widths.
-
-        Returns:
-            dict[str, tuple[int, ...]]: Required GGUF tensor names mapped to shapes in PyTorch dimension order.
-        """
-        shapes: dict[str, tuple[int, ...]] = {}
-
-        def affine(name: str, shape: tuple[int, ...]) -> None:
-            shapes[name + ".weight"] = shape
-            shapes[name + ".bias"] = (shape[0],)
-
-        c0 = self._widths[0]
-        affine("v.fastvit.stem.0", (c0, 3, 3, 3))
-        affine("v.fastvit.stem.1", (c0, 1, 3, 3))
-        affine("v.fastvit.stem.2", (c0, c0, 1, 1))
-        for (net, count), c in zip(_STAGES, self._widths, strict=True):
-            for block in range(count):
-                prefix = f"v.fastvit.net.{net}.blk.{block}"
-                affine(f"{prefix}.ffn.dw", (c, 1, 7, 7))
-                affine(f"{prefix}.ffn.fc1", (4 * c, c, 1, 1))
-                affine(f"{prefix}.ffn.fc2", (c, 4 * c, 1, 1))
-                if net in (0, 2, 4):
-                    affine(f"{prefix}.mixer", (c, 1, 3, 3))
-                    shapes[f"{prefix}.ls.weight"] = (c, 1, 1)
-                else:
-                    affine(f"{prefix}.norm", (c,))
-                    shapes[f"{prefix}.qkv.weight"] = (3 * c, c)
-                    affine(f"{prefix}.proj", (c, c))
-                    shapes[f"{prefix}.ls1.weight"] = shapes[f"{prefix}.ls2.weight"] = (c, 1, 1)
-        for net, c in zip((1, 3, 5, 8), self._widths[1:], strict=True):
-            affine(f"v.fastvit.net.{net}.down.0", (c, 1, 7, 7))
-            affine(f"v.fastvit.net.{net}.down.1", (c, c, 1, 1))
-        for net, c in zip((6, 9), self._widths[3:], strict=True):
-            affine(f"v.fastvit.net.{net}.pos", (c, 1, 7, 7))
-        vision_dim = 2 * self._widths[-1]
-        affine("v.fastvit.conv_exp", (vision_dim, 1, 3, 3))
-        affine("v.fastvit.conv_exp.se.reduce", (vision_dim // 16, vision_dim, 1, 1))
-        affine("v.fastvit.conv_exp.se.expand", (vision_dim, vision_dim // 16, 1, 1))
-        affine("mm.0", (self.n_embd_text, vision_dim))
-        affine("mm.2", (self.n_embd_text, self.n_embd_text))
-        return shapes
-
-    def prepare_tensors(self) -> None:
-        """Prepare the vision and projector tensors and check that the export is complete.
-
-        Raises:
-            ValueError: If a mapped tensor has an invalid shape or a required tensor or batch normalization parameter is missing.
-        """
-        super().prepare_tensors()
-        if self._ffn_bn_buf:
-            incomplete = [
-                f"{key}: {', '.join(part for part in _FFN_BN_PARTS if part not in parts)}"
-                for key, parts in sorted(self._ffn_bn_buf.items())
-            ]
-            raise ValueError(f"marvin_muse: incomplete ConvFFN batch normalization tensors: {'; '.join(incomplete)}")
-        missing = sorted(self._expected_shapes.keys() - self._emitted_tensors)
-        if missing:
-            preview = ", ".join(missing[:10])
-            raise ValueError(f"marvin_muse: missing {len(missing)} required vision/projector tensors: {preview}")
-
-    def get_vision_config(self) -> Dict[str, Any] | None:
-        """Fill the generic vision metadata required by ``MmprojModel``.
-
-        Returns:
-            Dict[str, Any] | None: A copy of the vision config with the converter's dimension metadata and defaults.
-        """
-        cfg = dict(self.global_config.get("vision_config") or {})
-        # The generic CLIP block count satisfies the metadata schema. FastViT stages are loaded separately.
-        cfg["n_layers"] = 1
-        cfg["hidden_size"] = int(self.global_config.get("mm_hidden_size", 3072))
-        cfg["intermediate_size"] = cfg["hidden_size"]
-        cfg["num_attention_heads"] = max(1, cfg["hidden_size"] // 32)
-        cfg.setdefault("image_size", 1024)
-        cfg.setdefault("patch_size", 64)
-        return cfg
-
-    def _validate_config(self) -> None:
-        """Validate the FastViT-HD graph settings and normalize the RGB statistics.
-
-        Raises:
-            ValueError: If the runtime does not support the model or preprocessing configuration.
-        """
-        cfg_vision = self.hparams_vision or {}
-        for config, expected in (
-            (self.global_config, {
-                "mm_projector_type": "mlp2x_gelu", "mm_patch_merge_type": "flat", "image_aspect_ratio": "pad",
-            }),
-            (cfg_vision, {
-                "model_type": "fastvithd", "image_size": 1024, "patch_size": 64, "num_channels": 3,
-                "inference_mode": True, "layers": [count for _, count in _STAGES],
-                "token_mixers": ["repmixer", "repmixer", "repmixer", "attention", "attention"],
-                "down_patch_size": 7, "down_stride": 2, "downsamples": [True] * 5,
-                "repmixer_kernel_size": 3, "mlp_ratios": [4] * 5, "cls_ratio": 2.0,
-                "pos_embs_shapes": [None, None, None, [7, 7], [7, 7]],
-            }),
-            (self.preprocessor_config, {
-                "size": {"shortest_edge": 1024}, "crop_size": {"height": 1024, "width": 1024},
-                "do_resize": True, "do_rescale": True, "do_normalize": True, "do_pad": False,
-                "resample": 3, "rescale_factor": 1 / 255,
-            }),
-        ):
-            for key, value in expected.items():
-                if config.get(key, value) != value:
-                    raise ValueError(f"marvin_muse: unsupported {key}={config[key]!r}; expected {value!r}")
-
-        self._widths = tuple(cfg_vision.get("embed_dims", _WIDTHS))
-        if (len(self._widths) != len(_STAGES)
-                or any(not isinstance(c, int) or c <= 0 for c in self._widths)
-                or any(b % a for a, b in zip(self._widths, self._widths[1:]))
-                or any(c % 32 for c in self._widths[3:])
-                or cfg_vision["hidden_size"] != 2 * self._widths[-1]):
-            raise ValueError(f"marvin_muse: incompatible embed_dims {self._widths} and mm_hidden_size {cfg_vision['hidden_size']}")
-
-        # GGUF infers array element types from Python values. The loader expects float32.
-        for key, default in (("image_mean", 0.0), ("image_std", 1.0)):
-            values = self.preprocessor_config.get(key, [default] * 3)
-            if not isinstance(values, (list, tuple)) or len(values) != 3 or not all(
-                type(v) in (int, float) and math.isfinite(v) and (key != "image_std" or v > 0) for v in values
-            ):
-                raise ValueError(f"marvin_muse: invalid {key}={values!r}; expected three finite RGB values and positive std")
-            self.preprocessor_config[key] = [float(v) for v in values]
-
-    def set_gguf_parameters(self) -> None:
-        """Write the generic vision metadata and Marvin Muse's projector settings."""
-        super().set_gguf_parameters()
-        self.gguf_writer.add_clip_projector_type("marvin_muse")
-        self.gguf_writer.add_vision_use_gelu(True)
-        self.gguf_writer.add_vision_attention_layernorm_eps(1e-5)
-
-    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
-        """Keep convolution kernels compatible with ggml backends.
-
-        Args:
-            name (str): Original checkpoint tensor name.
-            new_name (str): Mapped GGUF tensor name.
-            bid (int | None): Block index when the tensor belongs to a block; otherwise ``None``.
-            n_dims (int): Number of dimensions of the tensor.
-
-        Returns:
-            gguf.GGMLQuantizationType | bool: F16 or F32 for convolution weights, F32 for layer scales, or the base-class policy.
-        """
-        if new_name.startswith("v.fastvit.") or new_name.startswith("mm."):
-            if n_dims == 4:
-                return gguf.GGMLQuantizationType.F32 if self.ftype == gguf.LlamaFileType.ALL_F32 else gguf.GGMLQuantizationType.F16
-            if n_dims == 3:
-                return gguf.GGMLQuantizationType.F32
-        return super().tensor_force_quant(name, new_name, bid, n_dims)
+        self.global_config.update(
+            projector_hidden_act=merger["projector_hidden_act"],
+            projector_bias=merger["projector_bias"],
+            projector_layer_norm_eps=1e-6,
+            downsample_factor=vision["spatial_merge_size"],
+        )
+        return {**vision, "image_size": 512}
 
     @classmethod
-    def filter_tensors(cls, item: Tuple[str, Callable[[], torch.Tensor]]) -> Tuple[str, Callable[[], torch.Tensor]] | None:
-        """Keep vision-tower and projector tensors only.
-
-        Args:
-            item (Tuple[str, Callable[[], torch.Tensor]]): Checkpoint pair ``(tensor_name, lazy_loader)``.
-
-        Returns:
-            Tuple[str, Callable[[], torch.Tensor]] | None: The original pair for a vision or projector tensor, otherwise ``None``.
-        """
-        name, gen = item
-        if "vision_tower" in name or "mm_projector" in name:
-            return (name, gen)
+    def filter_tensors(cls, item):
+        if item[0].startswith((cls._encoder, cls._patch_merger, cls._projector)):
+            return super().filter_tensors(item)
         return None
 
-    def _emit(self, name: str, data: torch.Tensor) -> Iterable[Tuple[str, torch.Tensor]]:
-        """Validate a mapped tensor and record it if required.
+    def prepare_tensors(self):
+        vision = self.hparams_vision
+        assert vision is not None
+        merger = self.global_config["mm_vision_projector_config"]
+        width = vision["hidden_size"]
+        merged_width = merger["text_config"]["hidden_size"]
+        hidden = merger["projector_hidden_size"]
+        expected = {
+            self._encoder + "patchifier.weight": (width, 6 * vision["patch_size"] ** 2),
+            self._encoder + "embedding_norm.weight": (width,),
+            self._patch_merger + "layer_norm.weight": (width,),
+            self._patch_merger + "layer_norm.bias": (width,),
+            self._patch_merger + "linear_1.weight": (hidden, width * 4),
+            self._patch_merger + "linear_1.bias": (hidden,),
+            self._patch_merger + "linear_2.weight": (merged_width, hidden),
+            self._patch_merger + "linear_2.bias": (merged_width,),
+        }
+        outer_layers = (("0.", merged_width), ("2.", self.n_embd_text)) if self.global_config["mm_projector_type"] == "mlp2x_gelu" else (
+            ("", merged_width),
+        )
+        for prefix, input_width in outer_layers:
+            expected[self._projector + prefix + "weight"] = (self.n_embd_text, input_width)
+            expected[self._projector + prefix + "bias"] = (self.n_embd_text,)
 
-        Args:
-            name (str): Destination GGUF tensor name.
-            data (torch.Tensor): Mapped tensor in PyTorch dimension order.
+        missing = sorted(expected.keys() - self.model_tensors.keys())
+        if missing:
+            raise ValueError(f"Missing native Marvin Muse vision/projector tensors: {', '.join(missing)}")
+        for key, shape in expected.items():
+            actual = tuple(self.model_tensors[key]().shape)
+            if actual != shape:
+                raise ValueError(f"Unexpected native Marvin Muse tensor shape for {key}: {actual}, expected {shape}")
+        super().prepare_tensors()
 
-        Yields:
-            Tuple[str, torch.Tensor]: The destination name and contiguous tensor.
+    def set_gguf_parameters(self):
+        processor = self.preprocessor_config
+        vision = self.hparams_vision
+        assert vision is not None
+        if (processor.get("image_processor_type") != "MarvinMuseNativeImageProcessor"
+                or any(processor.get(key) is not True for key in ("do_resize", "do_rescale", "do_normalize", "do_convert_rgb"))
+                or processor.get("rescale_factor") != 1 / 255
+                or processor.get("patch_size") != vision["patch_size"]
+                or processor.get("temporal_patch_size") != vision["temporal_patch_size"]
+                or processor.get("merge_size") != vision["spatial_merge_size"]):
+            raise ValueError("Marvin Muse requires matching native LFM3-VL image preprocessing.")
+        size = processor.get("size")
+        min_pixels, max_pixels = (size.get(key) if isinstance(size, dict) else None for key in ("shortest_edge", "longest_edge"))
+        if type(min_pixels) is not int or type(max_pixels) is not int or not 0 < min_pixels <= max_pixels:
+            raise ValueError("Marvin Muse requires a positive image pixel budget.")
+        for key in ("image_mean", "image_std"):
+            values = processor.get(key)
+            if not isinstance(values, list) or len(values) != 3 or not all(
+                type(v) in (int, float) and math.isfinite(v) and (key != "image_std" or v > 0) for v in values
+            ):
+                raise ValueError(f"Marvin Muse requires valid RGB {key}.")
+            processor[key] = [float(v) for v in values]
+        super().set_gguf_parameters()
+        self._set_lfm3vl_gguf_parameters("marvin_muse")
 
-        Raises:
-            ValueError: If the tensor name or shape is incompatible with the graph.
-        """
-        shape = self._expected_shapes.get(name)
-        required = shape is not None
-        if shape is None and name.endswith(".qkv.bias"):
-            weight_shape = self._expected_shapes.get(name.removesuffix("bias") + "weight")
-            if weight_shape is not None:
-                shape = (weight_shape[0],)
-        if shape is None or tuple(data.shape) != shape:
-            raise ValueError(f"marvin_muse: unexpected tensor {name} with shape {tuple(data.shape)}; expected {shape}")
-        if required:
-            self._emitted_tensors.add(name)
-        yield name, data.contiguous()
-
-    def _map_projector(self, name: str, data: torch.Tensor) -> Iterable[Tuple[str, torch.Tensor]]:
-        """Map ``mm_projector.{i}.{weight,bias}`` to ``mm.{i}.{weight,bias}``.
-
-        Args:
-            name (str): Checkpoint tensor name.
-            data (torch.Tensor): Source tensor.
-
-        Yields:
-            Tuple[str, torch.Tensor]: Mapped projector tensor when ``name`` matches the projector pattern.
-
-        Raises:
-            ValueError: If the matched tensor is incompatible with the projector graph.
-        """
-        m = re.match(r".*mm_projector\.(\d+)\.(weight|bias)$", name)
-        if not m:
-            return
-        yield from self._emit(f"mm.{m.group(1)}.{m.group(2)}", data)
-
-    def _map_stem(self, name: str, data: torch.Tensor) -> Iterable[Tuple[str, torch.Tensor]]:
-        """Map stem ``patch_embed`` reparam convs to ``v.fastvit.stem.*``.
-
-        Args:
-            name (str): Checkpoint tensor name.
-            data (torch.Tensor): Source tensor.
-
-        Yields:
-            Tuple[str, torch.Tensor]: Mapped stem tensor when ``name`` matches ``patch_embed.{i}.reparam_conv.{weight|bias}``.
-
-        Raises:
-            ValueError: If the matched tensor is incompatible with the stem.
-        """
-        m = re.match(r".*patch_embed\.(\d+)\.reparam_conv\.(weight|bias)$", name)
-        if m:
-            yield from self._emit(f"v.fastvit.stem.{m.group(1)}.{m.group(2)}", data)
-
-    def _map_conv_exp(self, name: str, data: torch.Tensor) -> Iterable[Tuple[str, torch.Tensor]]:
-        """Map the final conv expansion and SE blocks.
-
-        Args:
-            name (str): Checkpoint tensor name under ``backbone.conv_exp``.
-            data (torch.Tensor): Source tensor.
-
-        Yields:
-            Tuple[str, torch.Tensor]: Mapped ``v.fastvit.conv_exp.*`` tensor when ``name`` matches a known convolution or SE parameter.
-
-        Raises:
-            ValueError: If the matched tensor is incompatible with the expansion or SE layers.
-        """
-        suffix = name.partition(".backbone.conv_exp.")[2]
-        layer, _, param = suffix.rpartition(".")
-        if param in ("weight", "bias") and layer in ("reparam_conv", "se.reduce", "se.expand"):
-            yield from self._emit(f"v.fastvit.conv_exp.{suffix.removeprefix('reparam_conv.')}", data)
-
-    def _map_network(self, name: str, data: torch.Tensor) -> Iterable[Tuple[str, torch.Tensor]]:
-        """Map backbone ``network.*`` tensors into the GGUF vision layout.
-
-        Buffers the ConvFFN depthwise convolution and batch normalization parameters until the full set is available for fusion.
-
-        Args:
-            name (str): Checkpoint tensor name under ``backbone.network``.
-            data (torch.Tensor): Source tensor.
-
-        Yields:
-            Tuple[str, torch.Tensor]: Mapped tensors, including the fused depthwise weight and bias for a complete ConvFFN block.
-
-        Raises:
-            ValueError: If a mapped tensor or a parameter needed for batch normalization fusion has the wrong shape.
-        """
-        stage, _, suffix = name.partition(".backbone.network.")[2].partition(".")
-        if not stage.isdecimal():
-            return
-
-        prefix = f"v.fastvit.net.{stage}"
-        block, _, block_suffix = suffix.partition(".")
-        if not block.isdecimal():
+    def modify_tensors(self, data_torch: torch.Tensor, name: str, bid: int | None) -> Iterable[tuple[str, torch.Tensor]]:
+        if name.startswith(self._encoder):
+            suffix = name.removeprefix(self._encoder)
+            yield from self._lfm3vl_tensors(data_torch, "model.vision_tower." + suffix, bid)
+        elif name.startswith(self._patch_merger):
+            suffix = name.removeprefix(self._patch_merger)
+            yield from self._lfm3vl_tensors(data_torch, "model.multi_modal_projector." + suffix, bid)
+        else:
+            suffix = name.removeprefix(self._projector)
             layer, _, param = suffix.rpartition(".")
-            if param in ("weight", "bias") and (target := _STAGE_CONVS.get(layer)):
-                yield from self._emit(f"{prefix}.{target}.{param}", data)
-            return
-
-        prefix = f"{prefix}.blk.{block}"
-        if target := _LAYER_SCALES.get(block_suffix):
-            yield from self._emit(f"{prefix}.{target}.weight", data)
-            return
-
-        layer, _, param = block_suffix.rpartition(".")
-        if param in ("weight", "bias") and (target := _BLOCK_LAYERS.get(layer)):
-            yield from self._emit(f"{prefix}.{target}.{param}", data)
-            return
-
-        part = block_suffix.removeprefix("convffn.conv.")
-        if part == block_suffix or part not in _FFN_BN_PARTS:
-            return
-
-        key = f"{stage}.{block}"
-        buf = self._ffn_bn_buf.setdefault(key, {})
-        buf[part] = data
-        if any(part not in buf for part in _FFN_BN_PARTS):
-            return
-
-        prefix += ".ffn.dw"
-        for part in _FFN_BN_PARTS:
-            param = "weight" if part == "conv.weight" else "bias"
-            shape = self._expected_shapes.get(f"{prefix}.{param}")
-            if tuple(buf[part].shape) != shape:
-                raise ValueError(f"marvin_muse: unexpected shape {tuple(buf[part].shape)} for {prefix} {part}; expected {shape}")
-        fw, fb = _fuse_conv_bn(*(buf[part] for part in _FFN_BN_PARTS))
-        yield from self._emit(f"{prefix}.weight", fw)
-        yield from self._emit(f"{prefix}.bias", fb)
-        del self._ffn_bn_buf[key]
-
-    def modify_tensors(self, data_torch: torch.Tensor, name: str, bid: int | None) -> Iterable[Tuple[str, torch.Tensor]]:
-        """Route each checkpoint tensor to the appropriate GGUF mapper.
-
-        Args:
-            data_torch (torch.Tensor): Source tensor from the checkpoint.
-            name (str): Checkpoint tensor name.
-            bid (int | None): Block index from the base converter. Unused for Marvin Muse vision export.
-
-        Yields:
-            Tuple[str, torch.Tensor]: Mapped pairs for retained vision and projector tensors.
-
-        Raises:
-            ValueError: If a mapped tensor is incompatible with the runtime graph.
-        """
-        del bid
-        if "mm_projector" in name:
-            yield from self._map_projector(name, data_torch)
-            return
-        if "vision_tower" not in name:
-            return
-        # Classifier head under backbone.head.* is unused at inference time.
-        if ".backbone.head." in name:
-            return
-        if "patch_embed" in name:
-            yield from self._map_stem(name, data_torch)
-            return
-        if ".backbone.conv_exp." in name:
-            yield from self._map_conv_exp(name, data_torch)
-            return
-        if ".backbone.network." in name:
-            yield from self._map_network(name, data_torch)
-            return
-        logger.warning("Skipping unmapped vision tensor: %s %s", name, tuple(data_torch.shape))
+            layers = {"": 3} if self.global_config["mm_projector_type"] == "linear" else {"0": 3, "2": 4}
+            yield f"mm.{layers[layer]}.{param}", data_torch

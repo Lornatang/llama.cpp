@@ -177,6 +177,15 @@ ggml_cgraph * mtmd_graph_lfm3vl::build() {
         model.mm_1_w, model.mm_1_b,
         ffn_op_type::FFN_GELU_ERF, -1);
 
+    if (model.proj_type == PROJECTOR_TYPE_MARVIN_MUSE) {
+        if (model.mm_4_w) {
+            embeddings = build_ffn(embeddings, model.mm_3_w, model.mm_3_b, nullptr, nullptr,
+                                   model.mm_4_w, model.mm_4_b, FFN_GELU_ERF, -1);
+        } else {
+            embeddings = ggml_add(ctx0, build_mm(model.mm_3_w, embeddings), model.mm_3_b);
+        }
+    }
+
     ggml_build_forward_expand(gf, embeddings);
 
     return gf;
