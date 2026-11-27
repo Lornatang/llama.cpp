@@ -238,3 +238,41 @@ kernel void kernel_get_rows_q4_0(
         *(((global float16 *) ((global char *) dst + i12*nb3 + i11*nb2 + i10*nb1)) + ind) = temp;
     }
 }
+
+#define QK8_0 32
+
+struct block_q8_0 {
+    half d;
+    char qs[QK8_0];
+};
+
+kernel void kernel_get_rows_q8_0(
+        global const char * quants,
+        global const half * scales,
+        ulong weight_offset,
+        int soa,
+        global const char * indices,
+        ulong index_offset,
+        global char * output,
+        ulong output_offset,
+        int width,
+        int rows
+) {
+    const size_t col = get_global_id(0);
+    const size_t index = get_global_id(1);
+    const int row = ((global const int *)(indices + index_offset))[index];
+    global float * dst = (global float *)(output + output_offset) + index * width;
+    if (row < 0 || row >= rows) {
+        dst[col] = 0.0f;
+        return;
+    }
+
+    const size_t element = (size_t)row * width + col;
+    const size_t block = element / QK8_0;
+    if (soa) {
+        dst[col] = convert_float(scales[block]) * quants[element];
+    } else {
+        global const struct block_q8_0 * blocks = (global const struct block_q8_0 *)(quants + weight_offset);
+        dst[col] = convert_float(blocks[block].d) * blocks[block].qs[col % QK8_0];
+    }
+}

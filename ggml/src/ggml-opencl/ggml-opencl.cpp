@@ -914,7 +914,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_top_k_f32, kernel_top_k_merge_f32;
     cl_kernel kernel_top_k_mask[2], kernel_top_k_mask_fill[2];
     cl_kernel kernel_lightning_indexer;
-    cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_i32, kernel_get_rows_q4_0;
+    cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_i32, kernel_get_rows_q4_0, kernel_get_rows_q8_0;
     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
     cl_kernel kernel_set_rows_q8_0_i64, kernel_set_rows_q8_0_i32;
     cl_kernel kernel_set_rows_q8_0_soa_i64, kernel_set_rows_q8_0_soa_i32;
@@ -2930,6 +2930,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_get_rows_i32  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_i32", &err), err));
         CL_CHECK((backend_ctx->kernel_get_rows_f16  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_get_rows_q4_0 = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q4_0", &err), err));
+        CL_CHECK((backend_ctx->kernel_get_rows_q8_0 = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q8_0", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -12756,6 +12757,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 case GGML_TYPE_F32:
                 case GGML_TYPE_F16:
                     return true;
+                case GGML_TYPE_Q8_0:
+                    return !op->src[0]->view_src && ggml_is_matrix(op->src[0]) && ggml_is_vector(op->src[1]) &&
+                           ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                           ggml_is_contiguous(op) && op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32;
                 case GGML_TYPE_Q4_0:
 #ifdef GGML_OPENCL_SOA_Q
                     // We do not support flattened Q4_0 (and possibly other Q's)
@@ -13270,18 +13275,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                      v->type == GGML_TYPE_Q4_0 && op->type == GGML_TYPE_F32 &&
                                      dk % 32 == 0 && dv % 32 == 0;
 
-            // A7X (Adreno 740, compiler E031.41) SIGSEGVs inside clBuildProgram
-            // building the flash_attn programs whose KV path is mixed-type or
-            // dequantized — f32_f16, q8_0, q4_0 (reproduced at DK=40 and DK=64; it
-            // is DK-independent). It is a driver crash, not codegen-wrong-output, so
-            // it cannot be caught in-process (fatal=false only handles clean compile
-            // errors). The uniform f16_f16 / f32_f32 programs compile fine on this
-            // compiler, so decline only the KV-convert variants; ggml then runs
-            // those (f16-KV / quant-KV) attention layers on the CPU backend.
-            // Negative compiler carve-out, same idiom as the Intel DK=512 decline
-            // below and the X1E driver-quirk guards.
-            if (backend_ctx && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X &&
-                (is_f32_f16 || is_f32_q8_0 || is_f32_q4_0)) {
+            // Older A7X drivers crash compiling mixed-type attention. Q8_0 can fall back to GPU dequantization.
+            if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X && (is_f32_f16 || is_f32_q4_0)) {
                 return false;
             }
 
@@ -13297,14 +13292,6 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             const bool kv_combo_ok = is_f32_f32 || is_f16_f16 || is_f32_f16 ||
                                          is_f32_q8_0 || is_f32_q4_0 || is_f32_asym;
             if (!kv_combo_ok) {
-                return false;
-            }
-
-            // Some compilers for A7x (Adreno 740, compiler E031.41) crashes when
-            // building FA kernels with mixed or quant types (f32_f16, f32_q8_0, f32_q4_0)
-            // Here we skip all A7x for these kernels to avoid crash
-            if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X &&
-                (is_f32_f16 || is_f32_q8_0 || is_f32_q4_0)) {
                 return false;
             }
 
@@ -18642,12 +18629,7 @@ static size_t ggml_backend_opencl_buffer_type_get_alignment(ggml_backend_buffer_
 }
 
 static size_t ggml_backend_opencl_buffer_type_get_max_size(ggml_backend_buffer_type_t buffer_type) {
-    static size_t max_size = -1;
-    if (max_size == (size_t)-1) {
-        ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer_type->device->context;
-        max_size = dev_ctx->backend_ctx->max_alloc_size;
-    }
-    return max_size;
+    return ggml_cl_init(buffer_type->device)->max_alloc_size;
 }
 
 static bool ggml_backend_opencl_buffer_type_supports_backend(ggml_backend_buffer_type_t buft, ggml_backend_t backend) {
@@ -19136,10 +19118,34 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
 
-    cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_ulong offset1 = extra1->offset + src1->view_offs;
     cl_ulong offsetd = extrad->offset + dst->view_offs;
 
+    if (src0->type == GGML_TYPE_Q8_0) {
+        const cl_int soa = ggml_cl_is_q8_0_soa(src0);
+        const auto * extra_soa = static_cast<const ggml_tensor_extra_cl_q8_0 *>(src0->extra);
+        const cl_mem quants = soa ? extra_soa->q : extra0->data_device;
+        const cl_mem scales = soa ? extra_soa->d : quants;
+        const cl_ulong weight_offset = soa ? 0 : extra0->offset + src0->view_offs;
+        const cl_kernel kernel = backend_ctx->kernel_get_rows_q8_0;
+
+        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &quants));
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &scales));
+        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_ulong), &weight_offset));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_int),   &soa));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &extra1->data_device));
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong), &offset1));
+        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &ne00));
+        CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_int),   &ne01));
+
+        size_t global_work_size[] = {(size_t)ne00, (size_t)ne10};
+        backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, nullptr, dst);
+        return;
+    }
+
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_kernel kernel;
 
     switch (src0->type) {
@@ -24625,7 +24631,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     const bool is_f16 = q->type == GGML_TYPE_F16;
     const bool is_mixed = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
-    const bool is_q8_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0;
+    // Use the uniform F32 kernel on A7X unless the Adreno 750 compiler supports native Q8_0.
+    const bool supports_native_q8_0 = backend_ctx->adreno_gen != ADRENO_GPU_GEN::A7X ||
+        (backend_ctx->device_name.find("750") != std::string::npos &&
+         backend_ctx->adreno_cl_compiler_version.newer_than_or_same(E031, 45, 2, 11));
+    const bool is_q8_0 = supports_native_q8_0 &&
+        q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0;
     const bool is_q4_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
