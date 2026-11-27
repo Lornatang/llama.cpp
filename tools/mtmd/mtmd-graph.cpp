@@ -66,6 +66,22 @@ mtmd_graph::mtmd_graph(const mtmd_graph & parent) :
     gf   = parent.gf;
 }
 
+ggml_cgraph * mtmd_graph::build_with_projection() {
+    ggml_cgraph * graph = build();
+    if (!model.marvin_projector.empty()) {
+        ggml_tensor * output = ggml_graph_node(graph, -1);
+        for (size_t i = 0; i < model.marvin_projector.size(); ++i) {
+            const auto & [weight, bias] = model.marvin_projector[i];
+            if (i > 0) {
+                output = ggml_gelu_erf(ctx0, output);
+            }
+            output = ggml_add(ctx0, build_mm(weight, output), bias);
+        }
+        ggml_build_forward_expand(graph, output);
+    }
+    return graph;
+}
+
 ggml_tensor * mtmd_graph::build_mm(ggml_tensor * w, ggml_tensor * x) const {
     return ggml_mul_mat(ctx0, w, x);
 }
@@ -805,7 +821,6 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
             {
                 builder = std::make_unique<mtmd_graph_sensenova_u1>(ctx, img);
             } break;
-        case PROJECTOR_TYPE_MARVIN_MUSE:
         case PROJECTOR_TYPE_LFM3VL:
             {
                 builder = std::make_unique<mtmd_graph_lfm3vl>(ctx, img);

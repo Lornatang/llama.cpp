@@ -209,6 +209,7 @@ struct mtmd_image_preprocessor_deepseek41v : mtmd_image_preprocessor {
 // custom llava-uhd slicing logic for MiniCPM-V
 struct mtmd_image_preprocessor_minicpmv : mtmd_image_preprocessor_llava_uhd {
     using mtmd_image_preprocessor_llava_uhd::mtmd_image_preprocessor_llava_uhd;
+    mtmd_image_preproc_out preprocess(const mtmd_image_u8 & img) const override;
     slice_instructions get_slice_instructions(const mtmd_image_size & original_size) const override;
 
 protected:

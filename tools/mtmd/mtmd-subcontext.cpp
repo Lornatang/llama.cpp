@@ -241,7 +241,7 @@ void mtmd_subcontext::warmup(const mtmd_image_f32_batch & batch) {
 }
 
 mtmd_subcontext::support_info_graph mtmd_subcontext::reserve_compute_meta(const mtmd_image_f32_batch & batch) {
-    ggml_cgraph * gf = mtmd_get_graph_builder(this, batch)->build();
+    ggml_cgraph * gf = mtmd_get_graph_builder(this, batch)->build_with_projection();
     ggml_backend_sched_reserve(backends.sched.get(), gf);
 
     const int n_splits = ggml_backend_sched_get_n_splits(backends.sched.get());
@@ -643,7 +643,7 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
 
     // build the inference graph
     ggml_backend_sched_reset(backends.sched.get());
-    ggml_cgraph * gf = mtmd_get_graph_builder(this, imgs, params)->build();
+    ggml_cgraph * gf = mtmd_get_graph_builder(this, imgs, params)->build_with_projection();
 
     // the last node is the embedding tensor, code2wav has no out_embd
     // read it before scheduling: backends may reorder the nodes of graphs with several outputs (Metal)
@@ -1023,21 +1023,22 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         case PROJECTOR_TYPE_MINICPMV4_7:
         case PROJECTOR_TYPE_MINICPM_OCR_1_0:
             {
-                const bool is_4x = hparams.n_merge == 2;
+                const bool use_vit_merger = hparams.n_merge == 4 || hparams.is_marvin();
+                const int buckets = hparams.is_marvin() ? std::sqrt(model.position_embeddings->ne[1]) : 70;
 
                 // SigLIP position buckets (same as resampler path)
                 std::vector<int32_t> positions(pos_h * pos_w);
                 std::vector<int> bucket_coords_h(pos_h);
                 std::vector<int> bucket_coords_w(pos_w);
                 for (int i = 0; i < pos_h; i++){
-                    bucket_coords_h[i] = std::floor(70.0*i/pos_h);
+                    bucket_coords_h[i] = std::floor(double(buckets)*i/pos_h);
                 }
                 for (int i = 0; i < pos_w; i++){
-                    bucket_coords_w[i] = std::floor(70.0*i/pos_w);
+                    bucket_coords_w[i] = std::floor(double(buckets)*i/pos_w);
                 }
                 for (int i = 0, id = 0; i < pos_h; i++){
                     for (int j = 0; j < pos_w; j++){
-                        positions[id++] = bucket_coords_h[i]*70 + bucket_coords_w[j];
+                        positions[id++] = bucket_coords_h[i]*buckets + bucket_coords_w[j];
                     }
                 }
                 set_input_i32("positions", positions);
@@ -1055,7 +1056,7 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                     return idx;
                 };
 
-                if (!is_4x) {
+                if (use_vit_merger) {
                     // window reorder indices for 2x2 windows
                     std::vector<int32_t> window_idx(n_pos);
                     std::vector<int32_t> inv_window_idx(n_pos);
@@ -1100,18 +1101,19 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                     set_input_i32("vit_merger_ds_idx_3", vit_merger_ds_3);
                 }
 
-                const int merger_h = is_4x ? pos_h : half_h;
-                const int merger_w = is_4x ? pos_w : half_w;
-                auto m_ds_0 = make_ds_idx(0, 0, merger_h / 2, merger_w / 2, merger_w);
-                auto m_ds_1 = make_ds_idx(0, 1, merger_h / 2, merger_w / 2, merger_w);
-                auto m_ds_2 = make_ds_idx(1, 0, merger_h / 2, merger_w / 2, merger_w);
-                auto m_ds_3 = make_ds_idx(1, 1, merger_h / 2, merger_w / 2, merger_w);
-                set_input_i32("merger_ds_idx_0", m_ds_0);
-                set_input_i32("merger_ds_idx_1", m_ds_1);
-                set_input_i32("merger_ds_idx_2", m_ds_2);
-                set_input_i32("merger_ds_idx_3", m_ds_3);
+                if (!hparams.is_marvin()) {
+                    const int merger_h = use_vit_merger ? half_h : pos_h;
+                    const int merger_w = use_vit_merger ? half_w : pos_w;
+                    auto m_ds_0 = make_ds_idx(0, 0, merger_h / 2, merger_w / 2, merger_w);
+                    auto m_ds_1 = make_ds_idx(0, 1, merger_h / 2, merger_w / 2, merger_w);
+                    auto m_ds_2 = make_ds_idx(1, 0, merger_h / 2, merger_w / 2, merger_w);
+                    auto m_ds_3 = make_ds_idx(1, 1, merger_h / 2, merger_w / 2, merger_w);
+                    set_input_i32("merger_ds_idx_0", m_ds_0);
+                    set_input_i32("merger_ds_idx_1", m_ds_1);
+                    set_input_i32("merger_ds_idx_2", m_ds_2);
+                    set_input_i32("merger_ds_idx_3", m_ds_3);
+                }
             } break;
-        case PROJECTOR_TYPE_MARVIN_MUSE:
         case PROJECTOR_TYPE_LFM3VL:
             {
                 // patches in raster-scan order (no interleave before encoder layers)

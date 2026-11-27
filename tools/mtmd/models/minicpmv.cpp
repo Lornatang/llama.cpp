@@ -114,12 +114,11 @@ ggml_cgraph * mtmd_graph_minicpmv::build() {
 }
 
 ggml_cgraph * mtmd_graph_minicpmv4_6::build() {
-    const bool is_4x = hparams.n_merge == 2;
+    const bool use_vit_merger = hparams.n_merge == 4 || hparams.is_marvin();
     const int n_pos  = n_patches;
     const int half_h = n_patches_y / 2;
     const int half_w = n_patches_x / 2;
     const int n_ds   = half_h * half_w;
-    const int n_out  = is_4x ? n_ds : (half_h / 2) * (half_w / 2);
 
     auto add_i32_input = [&](const char * name, int n) {
         ggml_tensor * t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n);
@@ -140,7 +139,7 @@ ggml_cgraph * mtmd_graph_minicpmv4_6::build() {
     ggml_tensor * vit_merger_ds_idx_2       = nullptr;
     ggml_tensor * vit_merger_ds_idx_3       = nullptr;
 
-    if (!is_4x) {
+    if (use_vit_merger) {
         // ViT merger window reorder indices + block-diagonal mask
         // (mask layout follows qwen2vl: -inf except for 4x4 blocks on the diagonal,
         // so each window-major group of 4 tokens only attends to itself)
@@ -154,12 +153,6 @@ ggml_cgraph * mtmd_graph_minicpmv4_6::build() {
         vit_merger_ds_idx_2 = add_i32_input("vit_merger_ds_idx_2", n_ds);
         vit_merger_ds_idx_3 = add_i32_input("vit_merger_ds_idx_3", n_ds);
     }
-
-    // final merger 2x2 downsample gather indices
-    ggml_tensor * merger_ds_idx_0 = add_i32_input("merger_ds_idx_0", n_out);
-    ggml_tensor * merger_ds_idx_1 = add_i32_input("merger_ds_idx_1", n_out);
-    ggml_tensor * merger_ds_idx_2 = add_i32_input("merger_ds_idx_2", n_out);
-    ggml_tensor * merger_ds_idx_3 = add_i32_input("merger_ds_idx_3", n_out);
 
     // patch embedding + positional embedding
     ggml_tensor * inp = build_inp();
@@ -230,7 +223,7 @@ ggml_cgraph * mtmd_graph_minicpmv4_6::build() {
         return input;
     };
 
-    if (!is_4x) {
+    if (use_vit_merger) {
         const int insert_lid = hparams.insert_layer_id;
 
         inpL = build_vit_layers(inpL, 0, insert_lid + 1, n_pos);
@@ -323,12 +316,13 @@ ggml_cgraph * mtmd_graph_minicpmv4_6::build() {
         cb(inpL, "post_ln", -1);
     }
 
-    // Final Merger (DownsampleMLP): another 2x2 spatial merge -> projector embedding
-    {
-        ggml_tensor * p0 = ggml_get_rows(ctx0, inpL, merger_ds_idx_0);
-        ggml_tensor * p1 = ggml_get_rows(ctx0, inpL, merger_ds_idx_1);
-        ggml_tensor * p2 = ggml_get_rows(ctx0, inpL, merger_ds_idx_2);
-        ggml_tensor * p3 = ggml_get_rows(ctx0, inpL, merger_ds_idx_3);
+    // Marvin Verse consumes the ViT output before MiniCPM's final merger.
+    if (!hparams.is_marvin()) {
+        const int n_out = use_vit_merger ? (half_h / 2) * (half_w / 2) : n_ds;
+        ggml_tensor * p0 = ggml_get_rows(ctx0, inpL, add_i32_input("merger_ds_idx_0", n_out));
+        ggml_tensor * p1 = ggml_get_rows(ctx0, inpL, add_i32_input("merger_ds_idx_1", n_out));
+        ggml_tensor * p2 = ggml_get_rows(ctx0, inpL, add_i32_input("merger_ds_idx_2", n_out));
+        ggml_tensor * p3 = ggml_get_rows(ctx0, inpL, add_i32_input("merger_ds_idx_3", n_out));
 
         ggml_tensor * cat = ggml_concat(ctx0, p0, p1, 0);
         cat = ggml_concat(ctx0, cat, p2, 0);

@@ -416,6 +416,8 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
     "LlavaForConditionalGeneration": "llava",
     "LlavaOnevision2ForConditionalGeneration": "magevl",
     "MarvinMuseForConditionalGeneration": "marvin",
+    "MarvinSparkForConditionalGeneration": "marvin",
+    "MarvinVerseForConditionalGeneration": "marvin",
     "MERaLiON2ForConditionalGeneration": "ultravox",
     "MiMoV2ForCausalLM": "mimo",
     "MiniMaxM3SparseForConditionalGeneration": "minimax",

@@ -82,6 +82,11 @@ struct mtmd_hparams {
     int32_t n_layer = 0;
     int32_t n_merge = 1; // number of patch merges **per-side**
 
+    int marvin_projector_layers = -1;
+    int marvin_resize_merge = 0;
+
+    bool is_marvin() const { return marvin_projector_layers >= 0; }
+
     // for preprocessor
     int32_t image_longest_edge = 0;
     int32_t image_min_pixels = -1;
@@ -1155,6 +1160,9 @@ struct mtmd_model {
     // runtime requirements declared by the model, applied by mtmd_subcontext
     int max_nodes        = 8192;
     bool flash_attn_auto = true; // false: MTMD_FLASH_ATTN_TYPE_AUTO resolves to disabled
+
+    // Marvin applies this projection after the native vision graph.
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> marvin_projector;
 
     // weights
     ggml_context_ptr        ctx_data;

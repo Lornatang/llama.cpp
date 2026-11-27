@@ -1,11 +1,7 @@
 # Copyright Larry. All Rights Reserved.
 # SPDX-License-Identifier: MIT
 # ==============================================================================
-"""Exercise Marvin GGUF conversion without downloading model weights.
-
-The synthetic checkpoint has one attention block and one spatial-convolution block. Set ``MARVIN_MUSE_MMPROJ_TEST`` to the path to ``test-mtmd-impl`` to also
-load the export and encode images on the CPU.
-"""
+"""Convert tiny native Marvin checkpoints and optionally encode them on the CPU."""
 
 import json
 import os
@@ -21,6 +17,7 @@ from conversion import get_model_class
 from conversion.base import gguf
 from conversion.marvin import MarvinMuseVisionModel
 
+
 class TestMarvinTextConversion(unittest.TestCase):
     """Check architecture dispatch and keep vision weights out of text exports."""
 
@@ -29,6 +26,8 @@ class TestMarvinTextConversion(unittest.TestCase):
             with self.subTest(variant=variant):
                 model = get_model_class(f"Marvin{variant}ForConditionalGeneration")
                 self.assertEqual(model.model_arch, arch)
+                mmproj = get_model_class(f"Marvin{variant}ForConditionalGeneration", mmproj=True)
+                self.assertEqual(mmproj.__module__, "conversion.marvin")
 
         self.assertIs(get_model_class("MarvinMuseForConditionalGeneration", mmproj=True), MarvinMuseVisionModel)
 
@@ -172,27 +171,27 @@ class TestMarvinMuseConversion(unittest.TestCase):
                 self.make_checkpoint(directory, projector=projector)
                 output = self.convert(directory, outtype)
                 reader = gguf.GGUFReader(output)
-                self.assertEqual(reader.fields["clip.vision.projector_type"].contents(), "marvin_muse")
+                self.assertEqual(reader.fields["clip.vision.projector_type"].contents(), "lfm3vl")
                 self.assertEqual(reader.fields["clip.vision.spatial_merge_size"].contents(), 2)
                 tensors = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
-                for name in ("mm.0.weight", "mm.2.weight", "mm.3.weight", "v.blk.0.attn_q.weight"):
+                for name in ("mm.0.weight", "mm.2.weight", "mm.marvin.0.weight", "v.blk.0.attn_q.weight"):
                     self.assertEqual(tensors[name], matrix_type)
-                self.assertEqual("mm.4.weight" in tensors, projector == "mlp2x_gelu")
+                self.assertEqual("mm.marvin.1.weight" in tensors, projector == "mlp2x_gelu")
                 self.assertEqual(tensors["v.patch_embd.weight"], gguf.GGMLQuantizationType.F16)
                 self.assertEqual(tensors["v.patch_embd.weight.1"], gguf.GGMLQuantizationType.F16)
                 self.assertEqual(tensors["v.blk.1.conv2d_spatial.weight"], gguf.GGMLQuantizationType.F32)
                 for key in ("image_mean", "image_std"):
                     self.assertEqual(reader.fields[f"clip.vision.{key}"].types, [gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.FLOAT32])
-                if runtime := os.environ.get("MARVIN_MUSE_MMPROJ_TEST"):
-                    run = subprocess.run([runtime, "--marvin-muse-mmproj", str(output)], capture_output=True, text=True)
+                if runtime := os.environ.get("MARVIN_MMPROJ_TEST"):
+                    run = subprocess.run([runtime, "--marvin-mmproj", str(output)], capture_output=True, text=True)
                     self.assertEqual(run.returncode, 0, run.stderr[-4000:])
 
     def test_rejects_incompatible_config_and_tensors(self):
         for override, tensor_override, error in (
-            ({"vision_config": {"model_type": "fastvithd"}}, {}, "requires native LFM3-VL"),
+            ({"vision_config": {"model_type": "fastvithd"}}, {}, "requires native lfm3_vl_vision"),
             ({"image_aspect_ratio": "pad"}, {}, "requires dynamic resolution"),
-            ({}, {"model.mm_projector.2.bias": None}, "Missing native Marvin Muse"),
-            ({}, {"model.mm_projector.2.weight": (32, 33)}, "Unexpected native Marvin Muse"),
+            ({}, {"model.mm_projector.2.bias": None}, "projector tensors do not match"),
+            ({}, {"model.mm_projector.2.weight": (32, 33)}, "Unexpected native Marvin tensor"),
         ):
             with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
@@ -200,6 +199,71 @@ class TestMarvinMuseConversion(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, error):
                     self.convert(directory)
                 self.assertFalse(Path(directory, "model-f16.gguf").exists())
+
+
+class TestMarvinPackedVisionConversion(unittest.TestCase):
+    def test_spark_and_verse_native_towers(self):
+        for variant, projector_type, depth in (("Spark", "qwen3vl_merger", 3), ("Verse", "minicpmv4_7", 0)):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                architecture = f"Marvin{variant}ForConditionalGeneration"
+                self.make_checkpoint(directory, variant, architecture, depth)
+                output = directory / "mmproj.gguf"
+                get_model_class(architecture, mmproj=True)(directory, gguf.LlamaFileType.ALL_F32, output).write()
+                reader = gguf.GGUFReader(output)
+                self.assertEqual(reader.fields["clip.vision.projector_type"].contents(), projector_type)
+                self.assertEqual(reader.fields["clip.vision.marvin_projector_layers"].contents(), depth)
+                if runtime := os.environ.get("MARVIN_MMPROJ_TEST"):
+                    run = subprocess.run([runtime, "--marvin-mmproj", str(output)], capture_output=True, text=True)
+                    self.assertEqual(run.returncode, 0, run.stderr[-4000:])
+
+    def make_checkpoint(self, directory, variant, architecture, depth):
+        vision = {"hidden_size": 32, "intermediate_size": 64, "patch_size": 16, "hidden_act": "gelu_pytorch_tanh"}
+        processor = {
+            "image_processor_type": f"Marvin{variant}ImageProcessorFast",
+            "do_resize": True, "do_rescale": True, "do_normalize": True, "do_convert_rgb": True,
+            "rescale_factor": 1 / 255, "resample": 3, "patch_size": 16,
+            "image_mean": [0.5] * 3, "image_std": [0.5] * 3,
+            "size": {"shortest_edge": 1024, "longest_edge": 16384},
+        }
+        if variant == "Spark":
+            vision.update(model_type="qwen3_5_vision", depth=1, num_heads=4, out_hidden_size=64,
+                          num_position_embeddings=16, spatial_merge_size=2, temporal_patch_size=2, in_channels=3)
+            processor.update(merge_size=2, temporal_patch_size=2)
+            matrices = {"patch_embed.proj": (32, 3, 2, 16, 16), "blocks.0.attn.qkv": (96, 32), "blocks.0.attn.proj": (32, 32),
+                        "blocks.0.mlp.linear_fc1": (64, 32), "blocks.0.mlp.linear_fc2": (32, 64),
+                        "merger.linear_fc1": (128, 128), "merger.linear_fc2": (64, 128)}
+            norms = {"blocks.0.norm1": 32, "blocks.0.norm2": 32, "merger.norm": 32}
+            position_name = "pos_embed.weight"
+        else:
+            vision.update(model_type="minicpmv4_7_vision", num_hidden_layers=1, num_attention_heads=4,
+                          insert_layer_id=0, image_size=64, layer_norm_eps=1e-6, window_kernel_size=[2, 2])
+            processor.update(scale_resolution=64, downsample_mode="16x", slice_mode=False)
+            matrices = {"embeddings.patch_embedding": (32, 3, 16, 16), "encoder.layers.0.mlp.fc1": (64, 32),
+                        "encoder.layers.0.mlp.fc2": (32, 64), "vit_merger.linear_1": (256, 128), "vit_merger.linear_2": (32, 256)}
+            matrices.update({f"{prefix}.self_attn.{proj}_proj": (32, 32)
+                             for prefix in ("encoder.layers.0", "vit_merger") for proj in ("q", "k", "v", "out")})
+            norms = {"encoder.layers.0.layer_norm1": 32, "encoder.layers.0.layer_norm2": 32,
+                     "post_layernorm": 32, "vit_merger.layer_norm1": 32, "vit_merger.pre_norm": 128}
+            position_name = "embeddings.position_embedding.weight"
+
+        width = vision.get("out_hidden_size", vision["hidden_size"])
+        config = {"architectures": [architecture], "model_type": f"marvin_{variant.lower()}", "hidden_size": 32,
+                  "mm_hidden_size": width, "mm_projector_type": f"mlp{depth}x_gelu" if depth else "identity",
+                  "image_aspect_ratio": "dynamic_resolution", "mm_vision_config": vision}
+        (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        (directory / "preprocessor_config.json").write_text(json.dumps(processor), encoding="utf-8")
+        encoder = "model.vision_tower.vision_tower.encoder."
+        shapes = {encoder + position_name: (16, 32)}
+        for name, shape in {**matrices, **{name: (size,) for name, size in norms.items()}}.items():
+            shapes[encoder + name + ".weight"] = shape
+            shapes[encoder + name + ".bias"] = (shape[0],)
+        for i in range(depth):
+            shapes[f"model.mm_projector.{2*i}.weight"] = (32, width if i == 0 else 32)
+            shapes[f"model.mm_projector.{2*i}.bias"] = (32,)
+        rng = np.random.default_rng(42)
+        save_file({name: rng.normal(0, 0.05, shape).astype(np.float32) for name, shape in shapes.items()},
+                  str(directory / "model.safetensors"))
 
 
 if __name__ == "__main__":

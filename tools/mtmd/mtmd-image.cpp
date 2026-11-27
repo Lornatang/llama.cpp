@@ -1040,6 +1040,19 @@ mtmd_image_preproc_out mtmd_image_preprocessor_longest_edge::preprocess(const mt
 // mtmd_image_preprocessor_minicpmv
 //
 
+mtmd_image_preproc_out mtmd_image_preprocessor_minicpmv::preprocess(const mtmd_image_u8 & img) const {
+    if (!hparams.is_marvin()) {
+        return mtmd_image_preprocessor_llava_uhd::preprocess(img);
+    }
+    const int align = hparams.patch_size * hparams.marvin_resize_merge;
+    const auto size = get_best_resize(img.get_size(), hparams.image_size, align, true);
+    mtmd_image_u8 resized;
+    img_tool::resize(img, resized, size, hparams.image_resize_algo, PAD_NONE);
+    mtmd_image_preproc_out output;
+    output.append(hparams, resized, true);
+    return output;
+}
+
 mtmd_image_preprocessor_llava_uhd::slice_instructions mtmd_image_preprocessor_minicpmv::get_slice_instructions(const mtmd_image_size & original_size) const {
     // overview only for small images, unlike generic llava-uhd which slices once one side exceeds scale resolution
     const int   slice_size = hparams.image_size;

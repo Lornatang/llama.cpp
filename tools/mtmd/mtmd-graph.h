@@ -59,6 +59,7 @@ struct mtmd_graph {
 
     virtual ~mtmd_graph() = default;
     virtual ggml_cgraph * build() = 0;
+    ggml_cgraph * build_with_projection();
 
     // wrapper around ggml_mul_mat, allow hooking (e.g. LoRA, clamping) depending on the model
     // tensor w should be the weight matrix, and tensor x should be the input

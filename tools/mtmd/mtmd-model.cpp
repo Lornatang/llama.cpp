@@ -150,6 +150,15 @@ struct mtmd_model_loader {
 
             model.proj_type = projector_type_from_string(proj_type);
 
+            if (modality == MTMD_MODALITY_VISION) {
+                get_u32("clip.vision.marvin_projector_layers", hparams.marvin_projector_layers, false);
+                if (hparams.is_marvin() && (hparams.marvin_projector_layers > 64 ||
+                        (model.proj_type != PROJECTOR_TYPE_QWEN3VL && model.proj_type != PROJECTOR_TYPE_LFM3VL &&
+                         model.proj_type != PROJECTOR_TYPE_MINICPMV4_7))) {
+                    throw std::runtime_error("invalid Marvin vision projector configuration");
+                }
+            }
+
             if (model.proj_type == PROJECTOR_TYPE_UNKNOWN) {
                 throw std::runtime_error(mtmd_format("%s: unknown projector type: %s\n", __func__, proj_type.c_str()));
             }
@@ -258,6 +267,10 @@ struct mtmd_model_loader {
                     hparams.ffn_op = FFN_GELU_QUICK;
                     log_ffn_op = "gelu_quick";
                 }
+                if (hparams.is_marvin() && !use_gelu && !use_silu) {
+                    hparams.ffn_op = FFN_GELU_ERF;
+                    log_ffn_op = "gelu_erf";
+                }
             }
 
             {
@@ -333,6 +346,12 @@ struct mtmd_model_loader {
                         hparams.n_merge = 4;
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
                         GGML_ASSERT(hparams.n_merge == 2 || hparams.n_merge == 4);
+                        if (hparams.is_marvin()) {
+                            get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.marvin_resize_merge);
+                            if (hparams.n_merge != 2 || (hparams.marvin_resize_merge != 2 && hparams.marvin_resize_merge != 4)) {
+                                throw std::runtime_error("invalid Marvin Verse merge geometry");
+                            }
+                        }
 
                         // no padding: the reference stretches the refined image to the target size
                         hparams.image_pad_ov = PAD_NONE;
@@ -677,6 +696,11 @@ struct mtmd_model_loader {
                         if (hparams.custom_image_max_tokens <= 0) {
                             get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels, false);
                         }
+                        if (hparams.is_marvin()) {
+                            const int side = hparams.patch_size * hparams.n_merge;
+                            hparams.set_warmup_n_tokens(std::clamp(hparams.image_max_pixels / (side * side), 1, 46 * 46));
+                            break;
+                        }
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                         const int warn_min_pixels = 1024 * hparams.n_merge * hparams.n_merge * hparams.patch_size * hparams.patch_size;
                         if (hparams.image_min_pixels < warn_min_pixels) {
@@ -711,7 +735,6 @@ struct mtmd_model_loader {
                         }
                         hparams.set_warmup_n_tokens(16*16);
                     } break;
-                case PROJECTOR_TYPE_MARVIN_MUSE:
                 case PROJECTOR_TYPE_LFM3VL:
                     {
                         std::string resize_algo;
@@ -743,7 +766,7 @@ struct mtmd_model_loader {
                         }
                         const int patch_area = hparams.patch_size * hparams.patch_size * hparams.n_merge * hparams.n_merge;
                         hparams.set_limit_image_tokens(min_pixels / patch_area, std::min(4096, max_pixels / patch_area));
-                        if (model.proj_type == PROJECTOR_TYPE_MARVIN_MUSE) {
+                        if (hparams.is_marvin()) {
                             if (hparams.custom_image_min_tokens <= 0) {
                                 hparams.image_min_pixels = min_pixels;
                             }
@@ -1422,6 +1445,16 @@ struct mtmd_model_loader {
                 }
             }
 
+            if (hparams.is_marvin() && model.proj_type != PROJECTOR_TYPE_LFM3VL) {
+                std::string resize_algo;
+                get_string(KEY_IMAGE_RESIZE_ALGO, resize_algo);
+                if (resize_algo != "bilinear" && resize_algo != "bicubic") {
+                    throw std::runtime_error("invalid Marvin resize algorithm");
+                }
+                hparams.set_image_resize_algo(resize_algo == "bilinear" ? RESIZE_ALGO_BILINEAR : RESIZE_ALGO_BICUBIC,
+                                             model.proj_type == PROJECTOR_TYPE_QWEN3VL);
+            }
+
             LOG_INF("%s: projector:          %s\n", __func__, proj_type.c_str());
             LOG_INF("%s: n_embd:             %d\n", __func__, hparams.n_embd);
             LOG_INF("%s: n_head:             %d\n", __func__, hparams.n_head);
@@ -1683,7 +1716,6 @@ struct mtmd_model_loader {
             auto & layer = model.layers[il];
             // lfm3vl / lfm3a conv layers have no attention tensors
             const bool o_w_required = model.proj_type != PROJECTOR_TYPE_LFM3VL
-                                   && model.proj_type != PROJECTOR_TYPE_MARVIN_MUSE
                                    && model.proj_type != PROJECTOR_TYPE_LFM3A;
             layer.k_w    = get_tensor(mtmd_format(TN_ATTN_K,      prefix, il, "weight"), false);
             layer.q_w    = get_tensor(mtmd_format(TN_ATTN_Q,      prefix, il, "weight"), false);
@@ -2003,7 +2035,7 @@ struct mtmd_model_loader {
             case PROJECTOR_TYPE_MINICPMV4_7:
             case PROJECTOR_TYPE_MINICPM_OCR_1_0:
                 {
-                    const bool merger_required = hparams.n_merge == 4;
+                    const bool merger_required = hparams.n_merge == 4 || hparams.is_marvin();
                     auto get_merger_tensor = [&](const std::string & name, bool required = true) {
                         return get_tensor(name, merger_required && required);
                     };
@@ -2026,6 +2058,9 @@ struct mtmd_model_loader {
                     model.vit_merger_ds_up_b   = get_merger_tensor(mtmd_format(TN_VIT_MERGER_DS_UP, "bias"), false);
                     model.vit_merger_ds_down_w = get_merger_tensor(mtmd_format(TN_VIT_MERGER_DS_DOWN, "weight"));
                     model.vit_merger_ds_down_b = get_merger_tensor(mtmd_format(TN_VIT_MERGER_DS_DOWN, "bias"), false);
+                    if (hparams.is_marvin()) {
+                        break;
+                    }
                     // Final Merger (DownsampleMLP)
                     model.mm_input_norm_w = get_tensor(TN_MM_INP_NORM);
                     model.mm_input_norm_b = get_tensor(TN_MM_INP_NORM_B, false);
@@ -2078,7 +2113,6 @@ struct mtmd_model_loader {
                     model.mm_1_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "weight"));
                     model.mm_1_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "bias"));
                 } break;
-            case PROJECTOR_TYPE_MARVIN_MUSE:
             case PROJECTOR_TYPE_LFM3VL:
                 {
                     model.mm_input_norm_w = get_tensor(TN_MM_INP_NORM);
@@ -2087,20 +2121,6 @@ struct mtmd_model_loader {
                     model.mm_0_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 0, "bias"));
                     model.mm_1_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "weight"));
                     model.mm_1_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "bias"));
-                    if (model.proj_type == PROJECTOR_TYPE_MARVIN_MUSE) {
-                        model.mm_3_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 3, "weight"));
-                        model.mm_3_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 3, "bias"));
-                        model.mm_4_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 4, "weight"), false);
-                        model.mm_4_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 4, "bias"), model.mm_4_w != nullptr);
-                        if (!model.patch_embeddings_1 || !model.lfm3vl_embedding_norm_w
-                                || model.mm_3_w->ne[0] != model.mm_1_w->ne[1]
-                                || model.mm_3_w->ne[1] != model.mm_3_b->ne[0]
-                                || (model.mm_4_w && (model.mm_4_w->ne[0] != model.mm_3_w->ne[1]
-                                                    || model.mm_4_w->ne[1] != model.mm_4_b->ne[0]))
-                                || model.n_mmproj_embd() != hparams.projection_dim) {
-                            throw std::runtime_error("invalid Marvin Muse vision/projector tensors");
-                        }
-                    }
                     // each layer must be either a conv block or a complete attention block
                     for (size_t il = 0; il < model.layers.size(); ++il) {
                         const auto & layer = model.layers[il];
@@ -4452,6 +4472,22 @@ struct mtmd_model_loader {
                 GGML_ASSERT(false && "unknown projector type");
         }
 
+        if (hparams.is_marvin()) {
+            int64_t width = model.n_mmproj_embd();
+            for (int i = 0; i < hparams.marvin_projector_layers; ++i) {
+                auto * weight = get_tensor(mtmd_format("mm.marvin.%d.weight", i));
+                auto * bias = get_tensor(mtmd_format("mm.marvin.%d.bias", i));
+                if (!ggml_is_matrix(weight) || weight->ne[0] != width || !ggml_is_vector(bias) || weight->ne[1] != bias->ne[0]) {
+                    throw std::runtime_error("invalid Marvin projection tensor shape");
+                }
+                model.marvin_projector.emplace_back(weight, bias);
+                width = weight->ne[1];
+            }
+            if (width != hparams.projection_dim) {
+                throw std::runtime_error("Marvin vision output width does not match the text model");
+            }
+        }
+
         // load data
         {
             std::vector<uint8_t> read_buf;
@@ -4745,7 +4781,6 @@ int mtmd_model::n_output_tokens_x(const mtmd_image_f32 * img) const {
         case PROJECTOR_TYPE_HUNYUANVL:
         case PROJECTOR_TYPE_YOUTUVL:
         case PROJECTOR_TYPE_MUSE_GLIMMER:
-        case PROJECTOR_TYPE_MARVIN_MUSE:
         case PROJECTOR_TYPE_LFM3VL:
             return (img->nx() / params.patch_size) / 2;
         case PROJECTOR_TYPE_HY_V4_FLASH:
@@ -4783,7 +4818,6 @@ int mtmd_model::n_output_tokens_y(const mtmd_image_f32 * img) const {
         case PROJECTOR_TYPE_HUNYUANVL:
         case PROJECTOR_TYPE_YOUTUVL:
         case PROJECTOR_TYPE_MUSE_GLIMMER:
-        case PROJECTOR_TYPE_MARVIN_MUSE:
         case PROJECTOR_TYPE_LFM3VL:
             return (img->ny() / params.patch_size) / 2;
         case PROJECTOR_TYPE_HY_V4_FLASH:
@@ -4886,7 +4920,6 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
         case PROJECTOR_TYPE_GLM5V:
         case PROJECTOR_TYPE_YOUTUVL:
         case PROJECTOR_TYPE_MUSE_GLIMMER:
-        case PROJECTOR_TYPE_MARVIN_MUSE:
         case PROJECTOR_TYPE_LFM3VL:
             {
                 // dynamic size (2 conv, so double patch size)
@@ -5223,6 +5256,9 @@ size_t mtmd_model::cbx_read_tensor(const char * name, float * out, size_t n_max)
 }
 
 int mtmd_model::n_mmproj_embd() const {
+    if (!marvin_projector.empty()) {
+        return marvin_projector.back().first->ne[1];
+    }
     switch (proj_type) {
         case PROJECTOR_TYPE_LDP:
             return mm_model_block_1_block_2_1_b->ne[0];
@@ -5236,8 +5272,6 @@ int mtmd_model::n_mmproj_embd() const {
         case PROJECTOR_TYPE_DOTS3NOTE_V:
         case PROJECTOR_TYPE_DOTS3NOTE_A:
             return mm_2_w->ne[1];
-        case PROJECTOR_TYPE_MARVIN_MUSE:
-            return mm_4_w ? mm_4_w->ne[1] : mm_3_w->ne[1];
         case PROJECTOR_TYPE_MLP_NORM:
             return mm_3_b->ne[0];
         case PROJECTOR_TYPE_MINICPMV:
@@ -5245,7 +5279,7 @@ int mtmd_model::n_mmproj_embd() const {
         case PROJECTOR_TYPE_MINICPMV4_6:
         case PROJECTOR_TYPE_MINICPMV4_7:
         case PROJECTOR_TYPE_MINICPM_OCR_1_0:
-            return mm_ffn_down_w->ne[1];
+            return hparams.is_marvin() ? hparams.n_embd : mm_ffn_down_w->ne[1];
         case PROJECTOR_TYPE_GLM_EDGE:
             return mm_model_mlp_3_w->ne[1];
         case PROJECTOR_TYPE_MINIMAX_M3:
@@ -5392,7 +5426,6 @@ int mtmd_model::n_temporal_merge() const {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
-        case PROJECTOR_TYPE_MARVIN_MUSE:
         case PROJECTOR_TYPE_LFM3VL:
         case PROJECTOR_TYPE_NEMOTRON_OMNI:
         case PROJECTOR_TYPE_LING3VL:

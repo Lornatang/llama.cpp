@@ -1043,6 +1043,14 @@ struct mtmd_context {
         image_preproc.reset();
 
         projector_type proj = ctx_v->model.proj_type;
+        if (ctx_v->model.hparams.is_marvin()) {
+            if (proj == PROJECTOR_TYPE_MINICPMV4_7) {
+                image_preproc = std::make_unique<mtmd_image_preprocessor_minicpmv>(models.v.get());
+            } else {
+                image_preproc = std::make_unique<mtmd_image_preprocessor_lfm3vl>(models.v.get());
+            }
+            return;
+        }
 
         switch (proj) {
             case PROJECTOR_TYPE_MLP:
@@ -1059,10 +1067,6 @@ struct mtmd_context {
                     } else {
                         image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(models.v.get());
                     }
-                } break;
-            case PROJECTOR_TYPE_MARVIN_MUSE:
-                {
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_lfm3vl>(models.v.get());
                 } break;
             case PROJECTOR_TYPE_MINICPMV:
                 {
@@ -2128,7 +2132,8 @@ struct mtmd_tokenizer {
                     image_tokens->nx = n_tokens;
                     image_tokens->ny = 1;
                 }
-                image_tokens->pos = ctx->pos_type;
+                // Marvin assigns consecutive text positions to visual embeddings, including for Qwen3.5.
+                image_tokens->pos = ctx->ctx_v->model.hparams.is_marvin() ? MTMD_POS_TYPE_NORMAL : ctx->pos_type;
                 // U1 uses M-RoPE, but unlike Qwen its image H/W coordinates are
                 // zero-based and the whole image occupies one temporal position.
                 if (ctx->proj_type_v() == PROJECTOR_TYPE_SENSENOVA_U1) {

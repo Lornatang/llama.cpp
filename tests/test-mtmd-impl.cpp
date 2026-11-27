@@ -1190,26 +1190,44 @@ MAKE_TEST(test_qwen3a_tokens_for_frames) {
 // main
 //
 
-static int test_marvin_muse_mmproj(const char * path) {
+static int test_marvin_mmproj(const char * path, const char * output_path) {
     try {
+        std::ofstream dump;
+        if (output_path) {
+            dump.open(output_path, std::ios::binary);
+            if (!dump) {
+                throw std::runtime_error("could not open Marvin embedding output");
+            }
+        }
         const auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         const auto models = mtmd_model_load(path, {}, ggml_backend_dev_buffer_type(cpu));
-        if (!models.v || models.v->proj_type != PROJECTOR_TYPE_MARVIN_MUSE) {
-            throw std::runtime_error("expected a Marvin Muse vision model");
+        if (!models.v || !models.v->hparams.is_marvin()) {
+            throw std::runtime_error("expected a native Marvin vision model");
         }
-        mtmd_backends backends(nullptr, 2, models.v->max_nodes, nullptr, nullptr);
-        mtmd_subcontext ctx(*models.v, backends, {MTMD_FLASH_ATTN_TYPE_DISABLED, false});
-        const auto preproc = mtmd_image_preprocessor_lfm3vl(models.v.get());
-        for (const auto & [size, expected_tokens] : std::vector<std::pair<mtmd_image_size, int>>{
-                {{64, 64}, 4}, {{96, 32}, 3}, {{32, 96}, 3}, {{81, 30}, 3}}) {
-            const auto images = preproc.preprocess(make_test_image(size));
+        const auto & model = *models.v;
+        mtmd_backends backends(nullptr, 2, model.max_nodes, nullptr, nullptr);
+        mtmd_subcontext ctx(model, backends, {MTMD_FLASH_ATTN_TYPE_DISABLED, false});
+        std::unique_ptr<mtmd_image_preprocessor> preproc;
+        if (model.proj_type == PROJECTOR_TYPE_MINICPMV4_7) {
+            preproc = std::make_unique<mtmd_image_preprocessor_minicpmv>(&model);
+        } else {
+            preproc = std::make_unique<mtmd_image_preprocessor_lfm3vl>(&model);
+        }
+        for (const auto & size : std::vector<mtmd_image_size>{{64, 64}, {96, 32}, {32, 96}, {81, 30}}) {
+            const auto images = preproc->preprocess(make_test_image(size));
             const auto & image = images.entries.at(0);
-            const int tokens = models.v->n_output_tokens(&image);
-            const int width = models.v->n_mmproj_embd();
+            const int patch_group = model.hparams.patch_size * 2;
+            const int expected_tokens = (image.nx() / patch_group) * (image.ny() / patch_group);
+            const int tokens = model.n_output_tokens(&image);
+            const int width = model.n_mmproj_embd();
             std::vector<float> output(tokens * width);
-            if (tokens != expected_tokens || width != 32 || !ctx.encode_image(2, &image, output)
+            if (images.entries.size() != 1 || images.has_overview() || tokens != expected_tokens || tokens <= 0
+                    || width != model.hparams.projection_dim || !ctx.encode_image(2, &image, output)
                     || !std::all_of(output.begin(), output.end(), [](float v) { return std::isfinite(v); })) {
-                throw std::runtime_error("invalid Marvin Muse output for " + image_size_to_str(size));
+                throw std::runtime_error("invalid Marvin output for " + image_size_to_str(size));
+            }
+            if (output_path && !dump.write(reinterpret_cast<const char *>(output.data()), output.size() * sizeof(float))) {
+                throw std::runtime_error("could not write Marvin embedding output");
             }
         }
         return 0;
@@ -1226,8 +1244,8 @@ int main(int argc, char ** argv) {
     // the audio preprocessors run on the CPU backend
     ggml_backend_load_all();
 
-    if (argc == 3 && std::strcmp(argv[1], "--marvin-muse-mmproj") == 0) {
-        return test_marvin_muse_mmproj(argv[2]);
+    if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--marvin-mmproj") == 0) {
+        return test_marvin_mmproj(argv[2], argc == 4 ? argv[3] : nullptr);
     }
 
     // the video helper logs every frame at debug level

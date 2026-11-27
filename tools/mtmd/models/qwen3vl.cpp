@@ -173,7 +173,7 @@ ggml_cgraph * mtmd_graph_qwen3vl::build() {
         model.mm_0_w, model.mm_0_b,
         nullptr, nullptr,
         model.mm_1_w, model.mm_1_b,
-        ffn_op_type::FFN_GELU, -1);
+        hparams.is_marvin() ? FFN_GELU_ERF : FFN_GELU, -1);
 
     if (deepstack_features) {
         embeddings = ggml_concat(ctx0, embeddings, deepstack_features, 0);
