@@ -35,6 +35,12 @@ export { default as SettingsChatParameterSourceIndicator } from './SettingsChat/
 export { default as SettingsGroup } from './SettingsGroup.svelte';
 
 /**
+ * The Hugging Face account the app is signed in with, and its Sign out. Shows nothing until
+ * a share has signed the app in.
+ */
+export { default as SettingsHuggingFaceAccount } from './SettingsHuggingFaceAccount.svelte';
+
+/**
  * Sticky footer with the save button for settings panel, shown only when
  * there are unsaved changes. Save commits form state to config store.
  */
@@ -51,6 +57,15 @@ export { default as SettingsResetButton } from './SettingsResetButton.svelte';
  * Provides UI for importing and exporting chat conversations.
  */
 export { default as SettingsChatImportExportTab } from './SettingsChat/SettingsChatImportExportTab.svelte';
+
+/**
+ * **SettingsChatVoiceTab** - Voice section of the settings
+ *
+ * The registry's voice fields, with the transcription model picker between them:
+ * in router mode it lists the server's models with audio input, on a single-model
+ * server it says whether that model can transcribe.
+ */
+export { default as SettingsChatVoiceTab } from './SettingsChat/SettingsChatVoiceTab.svelte';
 
 /**
  * Section wrapper for import/export sections. Displays a title, description,
@@ -70,6 +85,18 @@ export { default as SettingsMcpServers } from './SettingsMcpServers.svelte';
  * Handles validation, help text display, and parameter source indicators.
  */
 export { default as SettingsChatFields } from './SettingsChat/SettingsChatFields.svelte';
+
+/**
+ * The settings fields as a phone's native inset list: switch, picker and number rows grouped,
+ * prompts and single choices as groups of their own. Hands each change on as it is made.
+ */
+export { default as SettingsChatFieldsInset } from './SettingsChat/SettingsChatFieldsInset.svelte';
+
+/**
+ * Phone settings: a full-height sheet whose rows push each section, its advanced settings and the
+ * tools onto a stack of pages. Changes apply as they are made.
+ */
+export { default as SettingsSheet } from './SettingsSheet/SettingsSheet.svelte';
 
 /**
  * **SettingsChatToolsTab** - Tools configuration tab for chat settings

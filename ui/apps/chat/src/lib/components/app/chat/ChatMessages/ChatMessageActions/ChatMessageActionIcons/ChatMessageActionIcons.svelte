@@ -9,6 +9,7 @@
 		ChatMessageActionIconsBranchingControls,
 		DialogConfirmation
 	} from '#lib/components/app/index.ts';
+	import { SHARE_ACTION } from '#lib/constants/index.ts';
 	import { getChatMessageActionsContext, getChatMessageEditContext } from '#lib/contexts/index.ts';
 	import { conversationsStore } from '#lib/stores/index.ts';
 	import { untrack } from 'svelte';
@@ -97,13 +98,21 @@
 				/>
 			{/if}
 
+			{#if messageActions.share}
+				<ActionIcon
+					icon={SHARE_ACTION.icon}
+					onclick={messageActions.share}
+					tooltip={SHARE_ACTION.label}
+				/>
+			{/if}
+
 			<ActionIcon icon={Trash2} onclick={messageActions.requestDelete} tooltip="Delete" />
 		</div>
 	</div>
 
 	{#if showRawOutputSwitch}
 		<div class="flex items-center gap-2">
-			<span class="text-xs text-muted-foreground">Show raw output</span>
+			<span class="text-caption text-muted-foreground">Show raw output</span>
 
 			<Switch
 				checked={rawOutputEnabled}
@@ -161,7 +170,7 @@
 				}}
 			/>
 
-			<Label class="cursor-pointer text-sm font-normal" for="fork-attachments">
+			<Label class="cursor-pointer text-body-sm font-normal" for="fork-attachments">
 				Include all attachments
 			</Label>
 		</div>

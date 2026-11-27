@@ -10,8 +10,6 @@
 		isSelectionMode?: boolean;
 		selectedIds?: Set<string>;
 		onSelect: (id: string) => void;
-		onEdit: (id: string) => void;
-		onDelete: (id: string) => void;
 		onStop: (id: string) => void;
 		onToggleSelect?: (id: string) => void;
 		onEnterSelectionMode?: (id: string) => void;
@@ -24,8 +22,6 @@
 		currentChatId,
 		filteredConversations,
 		isSelectionMode = false,
-		onDelete,
-		onEdit,
 		onEnterSelectionMode,
 		onRowMouseDown,
 		onSelect,
@@ -46,9 +42,7 @@
 
 <div class="flex min-h-0 flex-1 flex-col gap-2 whitespace-nowrap {className}">
 	{#if showHeader}
-		<div
-			class="text-muted-foreground flex h-8 shrink-0 items-center rounded-md px-2 text-xs font-medium"
-		>
+		<div class="text-muted-foreground flex h-8 shrink-0 items-center rounded-md px-2 text-label-sm">
 			Search results
 		</div>
 	{/if}
@@ -70,8 +64,6 @@
 						isActive={currentChatId === conversation.id}
 						isSelected={selectedIds.has(conversation.id)}
 						{isSelectionMode}
-						{onDelete}
-						{onEdit}
 						{onEnterSelectionMode}
 						{onRowMouseDown}
 						{onSelect}
@@ -84,7 +76,7 @@
 
 			{#if tree.length === 0}
 				<li class="px-2 py-4 text-center">
-					<p class="mb-4 p-4 text-sm text-muted-foreground">
+					<p class="mb-4 p-4 text-body-sm text-muted-foreground">
 						{emptyMessage}
 					</p>
 				</li>
