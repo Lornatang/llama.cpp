@@ -67,10 +67,7 @@ class MarvinVisionModel(MmprojModel):
 
     def get_vision_config(self):
         vision = self.global_config.get("mm_vision_config")
-        if (not isinstance(vision, dict) or vision.get("model_type") != self.vision_type
-                or any(key in self.global_config for key in (
-                    "vision_config", "lfm3_vl_config", "lfm3_image_processor", "siglip2_vision_config", "siglip2_image_processor",
-                ))):
+        if not isinstance(vision, dict) or vision.get("model_type") != self.vision_type:
             raise ValueError(f"Marvin requires native {self.vision_type} vision settings.")
         if (self.global_config.get("image_aspect_ratio") != "dynamic_resolution"
                 or self.global_config.get("mm_patch_merge_type", "flat") != "flat"

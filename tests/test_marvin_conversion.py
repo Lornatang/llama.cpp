@@ -188,7 +188,7 @@ class TestMarvinMuseConversion(unittest.TestCase):
 
     def test_rejects_incompatible_config_and_tensors(self):
         for override, tensor_override, error in (
-            ({"vision_config": {"model_type": "fastvithd"}}, {}, "requires native lfm3_vl_vision"),
+            ({"mm_vision_config": None}, {}, "requires native lfm3_vl_vision"),
             ({"image_aspect_ratio": "pad"}, {}, "requires dynamic resolution"),
             ({}, {"model.mm_projector.2.bias": None}, "projector tensors do not match"),
             ({}, {"model.mm_projector.2.weight": (32, 33)}, "Unexpected native Marvin tensor"),
